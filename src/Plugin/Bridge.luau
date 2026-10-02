@@ -78,8 +78,9 @@ function Bridge:listenFromTests(onRecording: (string) -> (), onChanged: () -> ()
 	if not service then
 		return
 	end
-	local testType = Enum.PluginConnectionTargetType.Test
+	local testType
 	local ok = pcall(function()
+		testType = Enum.PluginConnectionTargetType.Test
 		if not service:CanHaveConnectionType(testType) then
 			error("no test connections")
 		end
