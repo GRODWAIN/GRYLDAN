@@ -62,12 +62,19 @@ function Recorder:start(opts): (boolean, string?)
 	local interval = 1 / fps
 	local nextSample = 0
 	local frames = self.rec.frames
+	local lastJoints = table.create(#motors, CFrame.identity)
+	local lastRoot = root.CFrame
 	local function sample()
-		local joints = table.create(#motors)
-		for i, motor in motors do
-			joints[i] = if motor.Parent then motor.Transform else CFrame.identity
+		-- after death or respawn the old parts are gone: hold the last pose
+		if root.Parent then
+			lastRoot = root.CFrame
+			local joints = table.create(#motors)
+			for i, motor in motors do
+				joints[i] = if motor.Parent then motor.Transform else lastJoints[i]
+			end
+			lastJoints = joints
 		end
-		table.insert(frames, { root = root.CFrame, joints = joints })
+		table.insert(frames, { root = lastRoot, joints = lastJoints })
 	end
 	sample()
 	nextSample = interval

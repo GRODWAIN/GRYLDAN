@@ -1,6 +1,6 @@
 --!nonstrict
 -- Drives puppets (and optionally the camera) from scene data. Used by the plugin in edit mode,
--- by the plugin inside a playtest while recording, and by the in-game player.
+-- by the plugin inside a playtest, and by the in-game player.
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
 
@@ -12,10 +12,14 @@ local SceneData = require(script.Parent.SceneData)
 local Playback = {}
 Playback.__index = Playback
 
+-- opts.folderName: puppet folder name; opts.parent: () -> Instance, where the folder lives.
 function Playback.new(opts)
 	opts = opts or {}
 	local self = setmetatable({}, Playback)
 	self.folderName = opts.folderName or "BBS_Puppets"
+	self.getParent = opts.parent or function()
+		return Workspace
+	end
 	self.puppets = {}
 	self.exclude = {}
 	self.time = 0
@@ -24,21 +28,27 @@ function Playback.new(opts)
 	self.useCamera = false
 	self.onTime = nil
 	self.onStopped = nil
+	self.onError = nil
+	self.errored = {}
 	return self
 end
 
 function Playback:getPuppetFolder(): Folder
+	local parent = self.getParent()
 	local f = self.puppetFolder
-	if f and f.Parent then
+	if f and f.Parent == parent then
 		return f
 	end
-	f = Workspace:FindFirstChild(self.folderName)
+	if f then
+		f:Destroy()
+	end
+	f = parent:FindFirstChild(self.folderName)
 	if not f then
 		f = Instance.new("Folder")
 		f.Name = self.folderName
 		-- puppets are regenerated from data: never saved with the place or copied into playtests
 		f.Archivable = false
-		f.Parent = Workspace
+		f.Parent = parent
 	end
 	self.puppetFolder = f
 	return f
@@ -70,8 +80,8 @@ function Playback:refresh()
 			self.puppets[actor] = nil
 		end
 	end
-	local folder = Workspace:FindFirstChild(self.folderName)
-	if folder then
+	local folder = self.puppetFolder
+	if folder and folder.Parent then
 		local tracked = {}
 		for _, state in self.puppets do
 			if state.model then
@@ -92,10 +102,12 @@ function Playback:invalidate(actor: Instance?)
 		if state then
 			self:clearPuppet(state)
 		end
+		self.errored[actor] = nil
 	else
 		for _, state in self.puppets do
 			self:clearPuppet(state)
 		end
+		self.errored = {}
 	end
 end
 
@@ -121,12 +133,30 @@ function Playback:ensureSkin(actor: Instance, state, skinName: string?): Model?
 	source.Archivable = true
 	local model = source:Clone()
 	source.Archivable = wasArchivable
+	if not model then
+		return nil
+	end
 	model.Name = SceneData.getName(actor)
 	model:SetAttribute("BBS_ActorId", actor.Name)
-	state.rig = Rig.prepare(model)
+	local rig = Rig.prepare(model)
+	if not rig then
+		model:Destroy()
+		error("в скине «" .. skinName .. "» нет ни одной детали (BasePart)", 0)
+	end
+	state.rig = rig
 	model.Parent = self:getPuppetFolder()
 	state.model = model
 	return model
+end
+
+-- Root CFrame of an actor at scene time t, straight from the recording.
+function Playback.actorRootAt(actor: Instance, t: number): CFrame?
+	local rec = SceneData.getRecording(actor)
+	if not rec then
+		return nil
+	end
+	local rel = t - (tonumber(actor:GetAttribute("Offset")) or 0)
+	return (Codec.sample(rec, rel))
 end
 
 function Playback:evaluateActor(actor: Instance, state, t: number)
@@ -143,7 +173,7 @@ function Playback:evaluateActor(actor: Instance, state, t: number)
 	end
 	local rootCf, joints = Codec.sample(rec, rel)
 	if rootCf then
-		Rig.apply(state.rig, model, rec.parts, rootCf, joints)
+		Rig.apply(state.rig, rec.parts, rootCf, joints)
 	end
 end
 
@@ -154,8 +184,15 @@ function Playback:evaluate(t: number)
 		for actor, state in self.puppets do
 			if actor.Parent then
 				local ok, err = pcall(self.evaluateActor, self, actor, state, t)
-				if not ok then
-					warn("[BBS Studio] " .. SceneData.getName(actor) .. ": " .. tostring(err))
+				if not ok and not self.errored[actor] then
+					-- report once per actor, not every frame
+					self.errored[actor] = true
+					local text = SceneData.getName(actor) .. ": " .. tostring(err)
+					if self.onError then
+						self.onError(text)
+					else
+						warn("[BBS Studio] " .. text)
+					end
 				end
 			end
 		end
@@ -224,7 +261,7 @@ function Playback:destroy()
 		self:clearPuppet(state)
 	end
 	self.puppets = {}
-	if self.puppetFolder and #self.puppetFolder:GetChildren() == 0 then
+	if self.puppetFolder then
 		self.puppetFolder:Destroy()
 	end
 	self.puppetFolder = nil

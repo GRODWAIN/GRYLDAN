@@ -5,8 +5,22 @@ local HttpService = game:GetService("HttpService")
 
 local Codec = {}
 
-Codec.VERSION = 1
+Codec.VERSION = 2
 Codec.CHUNK_SIZE = 100000
+
+-- Headers are made pure ASCII ("~" marker + %XX escapes) so plugin settings and messages
+-- never have to carry non-ASCII text such as Cyrillic names.
+local function asciiEscape(s: string): string
+	return (string.gsub(s, "[%%\128-\255]", function(c)
+		return string.format("%%%02X", string.byte(c))
+	end))
+end
+
+local function asciiUnescape(s: string): string
+	return (string.gsub(s, "%%(%x%x)", function(h)
+		return string.char(tonumber(h, 16) :: number)
+	end))
+end
 
 local function fmt(n: number, pattern: string): string
 	if n ~= n then
@@ -79,7 +93,7 @@ function Codec.encodeRecording(rec): string
 		end
 		out[i] = table.concat(nums, ",")
 	end
-	return HttpService:JSONEncode(header) .. "\n" .. table.concat(out, ";")
+	return "~" .. asciiEscape(HttpService:JSONEncode(header)) .. "\n" .. table.concat(out, ";")
 end
 
 function Codec.decodeRecording(str: string)
@@ -89,6 +103,9 @@ function Codec.decodeRecording(str: string)
 	local nl = string.find(str, "\n", 1, true)
 	local headerStr = if nl then string.sub(str, 1, nl - 1) else str
 	local body = if nl then string.sub(str, nl + 1) else ""
+	if string.sub(headerStr, 1, 1) == "~" then
+		headerStr = asciiUnescape(string.sub(headerStr, 2))
+	end
 	local ok, header = pcall(function()
 		return HttpService:JSONDecode(headerStr)
 	end)

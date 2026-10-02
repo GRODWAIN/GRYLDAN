@@ -52,12 +52,14 @@ local CameraTrack = require(Shared.CameraTrack)
 local Rig = require(Shared.Rig)
 local SceneData = require(Shared.SceneData)
 local Playback = require(Shared.Playback)
+local Log = require(Shared.Log)
 
 local UI = require(script.Parent.UI)
 local Timeline = require(script.Parent.Timeline)
 local History = require(script.Parent.History)
 local Appearance = require(script.Parent.Appearance)
 local Bridge = require(script.Parent.Bridge)
+local Version = require(script.Parent.Version)
 
 local C = UI.C
 local GAP = 6
@@ -76,6 +78,7 @@ require(ReplicatedStorage:WaitForChild("BBS_Runtime"):WaitForChild("RuntimePlaye
 local SETTING_FPS = "BBS_RecordFPS"
 local SETTING_COUNTDOWN = "BBS_RecordCountdown"
 local SETTING_FROM_CURSOR = "BBS_RecordFromCursor"
+local AUTO_IMPORT_MAX_AGE = 6 * 3600
 
 local TABS = {
 	{ id = "actors", label = "Актёры" },
@@ -122,21 +125,33 @@ function App.start(plugin: Plugin)
 	self.lastPendingCount = -1
 	self.connections = {}
 	self.bridge = Bridge.new(plugin)
+	self.showPath = false
+	self.pathKey = nil
 
-	self.playback = Playback.new({ folderName = "BBS_Puppets" })
+	-- Camera children are local to this Studio window: previews are not replicated to Team Create
+	-- collaborators and are never saved.
+	self.playback = Playback.new({
+		folderName = "BBS_Puppets",
+		parent = function()
+			return Workspace.CurrentCamera
+		end,
+	})
 	self.playback.onTime = function(t)
 		self:onTime(t)
 	end
 	self.playback.onStopped = function()
 		self:updateTransport()
 	end
+	self.playback.onError = function(text)
+		Log.error(text)
+	end
 
 	local toolbar = plugin:CreateToolbar("BBS Studio")
 	self.button = toolbar:CreateButton("BBSStudioOpen", "BBS Studio — съёмка машинимы", "", "BBS Studio")
 	self.button.ClickableWhenViewportHidden = true
-	local info = DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Right, false, false, 460, 680, 380, 360)
+	local info = DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Right, false, false, 470, 700, 380, 360)
 	self.widget = UI.createWidget(plugin, "BBSStudio_Edit", info)
-	self.widget.Title = "BBS Studio"
+	self.widget.Title = Version.LABEL
 	self.widget.Name = "BBSStudio"
 	self.widget.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 	self.button.Click:Connect(function()
@@ -167,6 +182,12 @@ function App.start(plugin: Plugin)
 	end, function()
 		self:onTestsChanged()
 	end)
+	self:createActions()
+	Log.onChanged(function()
+		if self.tab == "scene" and self.alive then
+			self:render()
+		end
+	end)
 
 	task.spawn(function()
 		while self.alive do
@@ -176,6 +197,7 @@ function App.start(plugin: Plugin)
 			end
 			if not self.bridge:hasActiveTests() then
 				self:processQueue()
+				self:autoImportPending()
 			end
 			local count = #self.bridge:getPendingIndex() + #self.importQueue
 			if count ~= self.lastPendingCount then
@@ -190,10 +212,17 @@ function App.start(plugin: Plugin)
 	plugin.Unloading:Connect(function()
 		self.alive = false
 		self.playback:destroy()
+		self:clearPath()
 		for _, conn in self.connections do
 			conn:Disconnect()
 		end
 	end)
+
+	-- leftovers of v0.1, which kept puppets in Workspace
+	local legacy = Workspace:FindFirstChild("BBS_Puppets")
+	if legacy and not legacy.Archivable then
+		legacy:Destroy()
+	end
 
 	if SceneData.getRoot(false) then
 		self.playback:refresh()
@@ -201,6 +230,25 @@ function App.start(plugin: Plugin)
 	end
 	self:render()
 	return self
+end
+
+function App:createActions()
+	local plugin = self.plugin
+	pcall(function()
+		plugin:CreatePluginAction("BBSStudio_PlayPause", "BBS: воспроизведение / пауза", "Проиграть сцену BBS Studio", "", true).Triggered
+			:Connect(function()
+				self:togglePlay()
+			end)
+		plugin:CreatePluginAction("BBSStudio_CameraKey", "BBS: ключ камеры", "Добавить ключ камеры из текущего вида", "", true).Triggered
+			:Connect(function()
+				self:addCameraKey()
+			end)
+		plugin:CreatePluginAction("BBSStudio_ToStart", "BBS: в начало", "Перемотать сцену в начало", "", true).Triggered
+			:Connect(function()
+				self:pausePlayback()
+				self:seek(0)
+			end)
+	end)
 end
 
 -- Layout ---------------------------------------------------------------------
@@ -424,9 +472,9 @@ function App:setUseCamera(v: boolean)
 end
 
 function App:onSelectionChanged()
-	local folder = Workspace:FindFirstChild("BBS_Puppets")
+	local folder = self.playback.puppetFolder
 	local root = SceneData.getRoot(false)
-	if not folder or not root then
+	if not folder or not folder.Parent or not root then
 		return
 	end
 	for _, obj in Selection:Get() do
@@ -466,6 +514,111 @@ function App:render()
 	self.timeline:rebuild()
 	self:onTime(self.playback.time)
 	self:updateTransport()
+	self:updatePath()
+end
+
+-- Viewport helpers ------------------------------------------------------------
+
+function App:focusActor(actor: Instance)
+	local rec = SceneData.getRecording(actor)
+	if not rec then
+		self:toast("У актёра нет записи", C.warn)
+		return
+	end
+	local offset = tonumber(actor:GetAttribute("Offset")) or 0
+	local t = self.playback.time
+	if t < offset or t > offset + rec.length then
+		self:pausePlayback()
+		self:seek(offset)
+	end
+	local cf = Playback.actorRootAt(actor, self.playback.time)
+	if not cf then
+		return
+	end
+	self:setUseCamera(false)
+	local pos = cf.Position
+	local look = cf.LookVector * Vector3.new(1, 0, 1)
+	if look.Magnitude < 1e-3 then
+		look = Vector3.new(0, 0, -1)
+	end
+	local from = pos + look.Unit * 12 + Vector3.new(0, 4, 0)
+	local cam = Workspace.CurrentCamera
+	cam.CFrame = CFrame.lookAt(from, pos)
+	cam.Focus = CFrame.new(pos)
+	if not self.playback:getPuppet(actor) then
+		local skin = SceneData.skinAt(actor, self.playback.time - offset)
+		if not skin or not SceneData.getSkin(actor, skin) then
+			self:toast("Камера наведена, но у актёра нет скина в этот момент — добавьте скин", C.warn)
+			return
+		end
+	end
+	self:toast("Камера наведена на «" .. SceneData.getName(actor) .. "»", C.good)
+end
+
+function App:clearPath()
+	local cam = Workspace.CurrentCamera
+	local folder = cam and cam:FindFirstChild("BBS_Path")
+	if folder then
+		folder:Destroy()
+	end
+	self.pathKey = nil
+end
+
+-- Draws the selected actor's root trajectory as a dotted line in the viewport.
+function App:updatePath()
+	local actor = self.selected
+	if not self.showPath or not actor or not actor.Parent then
+		self:clearPath()
+		return
+	end
+	local rec = SceneData.getRecording(actor)
+	local key = actor.Name .. ":" .. tostring(actor:GetAttribute("RecVersion"))
+	if not rec or key == self.pathKey then
+		return
+	end
+	self:clearPath()
+	self.pathKey = key
+	local folder = Instance.new("Folder")
+	folder.Name = "BBS_Path"
+	folder.Archivable = false
+	local color = actor:GetAttribute("Color") or C.accent
+	local step = math.max(1, math.floor(#rec.frames / 200))
+	for i = 1, #rec.frames, step do
+		local dot = Instance.new("Part")
+		dot.Shape = Enum.PartType.Ball
+		dot.Size = Vector3.new(0.35, 0.35, 0.35)
+		dot.Material = Enum.Material.Neon
+		dot.Color = color
+		dot.Anchored = true
+		dot.CanCollide = false
+		dot.CanTouch = false
+		dot.CanQuery = false
+		dot.CastShadow = false
+		dot.CFrame = CFrame.new(rec.frames[i].root.Position)
+		dot.Parent = folder
+	end
+	folder.Parent = Workspace.CurrentCamera
+end
+
+function App:autoImportPending()
+	local now = os.time()
+	local place = Bridge.placeKey()
+	for _, entry in self.bridge:getPendingIndex() do
+		local fresh = type(entry.time) == "number" and now - entry.time < AUTO_IMPORT_MAX_AGE
+		if entry.place == place and fresh and not self.importing[entry.id] then
+			local str = self.bridge:loadPending(entry.id)
+			if str then
+				Log.info("импорт из резервного сохранения: «" .. Bridge.entryName(entry) .. "»")
+				local ok, err = pcall(self.importRecordingString, self, str)
+				if not ok then
+					Log.error("импорт не удался: " .. tostring(err))
+					self.bridge:removePending(entry.id)
+				end
+			else
+				self.bridge:removePending(entry.id)
+			end
+		end
+	end
 end
 
 -- Actors tab -----------------------------------------------------------------
@@ -552,6 +705,9 @@ function App:renderActorRow(parent: Instance, actor: Instance)
 	UI.button("⧉", function()
 		self:duplicateActor(actor)
 	end, { Parent = row })
+	UI.button("◎", function()
+		self:focusActor(actor)
+	end, { Parent = row })
 	UI.button("×", function()
 		if self.selected == actor then
 			self.selected = nil
@@ -588,8 +744,12 @@ function App:renderActorDetails(actor: Instance)
 				Selection:Set({ puppet })
 			end
 		end),
-		UI.button("Показать данные", function()
-			Selection:Set({ actor })
+		UI.button("◎ Навести камеру", function()
+			self:focusActor(actor)
+		end),
+		UI.toggle("Траектория", self.showPath, function(v)
+			self.showPath = v
+			self:updatePath()
 		end),
 	}, { Parent = sec })
 
@@ -1016,9 +1176,9 @@ function App:renderRecord()
 	local sec = UI.section("Запись актёра", self.content)
 	UI.paragraph(
 		"1. Нажмите Play (F5). В тесте откроется окно «BBS Studio — запись».\n"
-			.. "2. Выберите цель (новый актёр или перезапись старого) и нажмите «● Записать». После отсчёта играйте: записываются позиция и вся анимация персонажа. Уже записанные актёры и камера проигрываются одновременно — можно играть сцену «в паре» с прошлыми дублями.\n"
-			.. "3. Нажмите «■ Стоп». Для горячей клавиши назначьте действие «BBS: запись / стоп» в File → Customize Shortcuts.\n"
-			.. "4. Остановите тест — записи станут актёрами с вашим аватаром.",
+			.. "2. Нажмите «● Записать» (в окне или в панели сверху экрана игры). После отсчёта играйте: записываются позиция и вся анимация персонажа.\n"
+			.. "3. Нажмите «■ Стоп». Дубль сразу появится в тесте — «▶ Просмотр» покажет его. Следующие дубли записываются рядом с прошлыми.\n"
+			.. "4. Остановите тест (Shift+F5) — дубли станут актёрами здесь, камера наведётся на нового актёра.",
 		{ Parent = sec, TextColor3 = C.text }
 	)
 	local row = UI.row({}, { Parent = sec })
@@ -1073,7 +1233,9 @@ function App:renderRecord()
 	for _, entry in pending do
 		local r = UI.row({}, { Parent = backup })
 		local when = if entry.time then os.date("%d.%m %H:%M", entry.time) else ""
-		UI.flex(UI.label(string.format("%s · %.1f с · %s", tostring(entry.name), entry.length or 0, when), {
+		local other = entry.place ~= Bridge.placeKey()
+		local label = string.format("%s · %.1f с · %s", Bridge.entryName(entry), entry.length or 0, when)
+		UI.flex(UI.label(label .. (if other then " · другой плейс" else ""), {
 			Parent = r,
 			Size = UDim2.fromOffset(80, 24),
 		}))
@@ -1118,7 +1280,7 @@ function App:processQueue()
 		local str = table.remove(self.importQueue, 1)
 		local ok, err = pcall(self.importRecordingString, self, str)
 		if not ok then
-			warn("[BBS Studio] импорт не удался: " .. tostring(err))
+			Log.error("импорт не удался: " .. tostring(err))
 		end
 	end
 	self.processing = false
@@ -1127,7 +1289,7 @@ end
 function App:importRecordingString(str: string)
 	local rec = Codec.decodeRecording(str)
 	if not rec or #rec.frames == 0 then
-		self:toast("Повреждённая запись", C.warn)
+		Log.error("получена повреждённая запись (" .. #str .. " байт)")
 		return
 	end
 	if self.importing[rec.id] then
@@ -1153,11 +1315,17 @@ function App:importRecordingString(str: string)
 	if not target then
 		self:toast("Создаю актёра «" .. rec.name .. "»…")
 		local ok, model = pcall(Appearance.rigForRecording, rec)
-		if ok then
+		if ok and model then
 			skin = model
 			skin.Name = rec.name
 		else
-			warn("[BBS Studio] не удалось создать скин: " .. tostring(model))
+			Log.error(
+				"не удалось загрузить аватар для «"
+					.. rec.name
+					.. "»: "
+					.. tostring(model)
+					.. ". Добавьте скин вручную: «+ Скин из выделенной модели»."
+			)
 		end
 	end
 
@@ -1178,11 +1346,14 @@ function App:importRecordingString(str: string)
 	end)
 	if ok then
 		self.bridge:removePending(rec.id)
-		self:toast("Запись «" .. rec.name .. "» добавлена", C.good)
+		Log.info(string.format("актёр «%s» добавлен: %.1f с, %d кадров", rec.name, rec.length, #rec.frames))
 		self.tab = "actors"
 	end
 	self.importing[rec.id] = nil
 	self:onDataChanged()
+	if ok and self.selected then
+		self:focusActor(self.selected)
+	end
 end
 
 -- Scene tab ------------------------------------------------------------------
@@ -1315,6 +1486,43 @@ function App:renderScene()
 			end)
 		end),
 	}, { Parent = player })
+
+	self:renderDiagnostics()
+end
+
+function App:renderDiagnostics()
+	local sec = UI.section("Диагностика", self.content)
+	local root = SceneData.getRoot(false)
+	local actors = if root then SceneData.listActors(root) else {}
+	local puppets = 0
+	for _, actor in actors do
+		if self.playback:getPuppet(actor) then
+			puppets += 1
+		end
+	end
+	local lines = {
+		Version.LABEL,
+		"Связь с тестами: " .. (if self.bridge.available then "PluginConnectionService" else "только резервное сохранение"),
+		"Активных тестов: " .. (if self.bridge:hasActiveTests() then "есть" else "нет"),
+		string.format("Актёров: %d · видимых марионеток сейчас: %d", #actors, puppets),
+		"Ожидают импорта: " .. (#self.bridge:getPendingIndex() + #self.importQueue),
+	}
+	for _, line in lines do
+		UI.label(line, { Parent = sec, TextSize = 13, TextColor3 = C.dim })
+	end
+	UI.label("Журнал", { Parent = sec, Font = UI.FONT_BOLD })
+	local entries = Log.entries
+	if #entries == 0 then
+		UI.label("пусто", { Parent = sec, TextSize = 12, TextColor3 = C.dim })
+	end
+	for i = #entries, math.max(1, #entries - 19), -1 do
+		local e = entries[i]
+		UI.paragraph(os.date("%H:%M:%S", e.time) .. "  " .. e.text, {
+			Parent = sec,
+			TextSize = 12,
+			TextColor3 = if e.level == "error" then C.danger elseif e.level == "warn" then C.warn else C.text,
+		})
+	end
 end
 
 function App:installRuntime()
@@ -1551,16 +1759,22 @@ return Appearance
           <string name="Name">Bridge</string>
           <string name="Source"><![CDATA[--!nonstrict
 -- Moves recordings from the playtest client back to the edit session.
--- Primary path: PluginConnectionService. Backup: plugin settings, which survive the playtest.
+-- Channel 1: PluginConnectionService messages (split into parts).
+-- Channel 2: plugin settings, which outlive the playtest; the edit side polls and imports them.
 local HttpService = game:GetService("HttpService")
+
+local Log = require(script.Parent.Parent.Shared.Log)
 
 local Bridge = {}
 Bridge.__index = Bridge
 
-local INDEX_KEY = "BBS_PendingIndex"
-local REC_PREFIX = "BBS_Rec_"
-local MSG_REC = "BBS_REC\n"
+local INDEX_KEY = "BBS_PendingIndex2"
+local REC_PREFIX = "BBS_Rec2_"
+local MSG_PART = "BBS_PART\n"
 local MSG_CFG = "BBS_CFG\n"
+local MSG_HELLO = "BBS_HELLO\n"
+local PART_SIZE = 60000
+local MAX_PENDING = 30
 
 local function getService()
 	local ok, service = pcall(function()
@@ -1573,11 +1787,21 @@ local function startsWith(s: string, prefix: string): boolean
 	return string.sub(s, 1, #prefix) == prefix
 end
 
+-- Identifies the place so backups recorded in one place are not auto-imported into another.
+function Bridge.placeKey(): string
+	if game.PlaceId ~= 0 then
+		return "id:" .. tostring(game.PlaceId)
+	end
+	return "local"
+end
+
 function Bridge.new(plugin: Plugin)
 	local self = setmetatable({}, Bridge)
 	self.plugin = plugin
 	self.tests = {}
+	self.partial = {}
 	self.editConnection = nil
+	self.available = getService() ~= nil
 	return self
 end
 
@@ -1593,13 +1817,24 @@ function Bridge:getPendingIndex()
 	return index
 end
 
-function Bridge:savePending(rec, str: string): boolean
-	return (pcall(function()
+function Bridge:savePending(rec, str: string): (boolean, string?)
+	local ok, err = pcall(function()
 		self.plugin:SetSetting(REC_PREFIX .. rec.id, str)
 		local index = self:getPendingIndex()
-		table.insert(index, { id = rec.id, name = rec.name, length = rec.length, time = os.time() })
+		table.insert(index, {
+			id = rec.id,
+			name = HttpService:UrlEncode(rec.name),
+			length = rec.length,
+			time = os.time(),
+			place = Bridge.placeKey(),
+		})
+		while #index > MAX_PENDING do
+			local old = table.remove(index, 1)
+			self.plugin:SetSetting(REC_PREFIX .. old.id, nil)
+		end
 		self.plugin:SetSetting(INDEX_KEY, index)
-	end))
+	end)
+	return ok, if ok then nil else tostring(err)
 end
 
 function Bridge:loadPending(id: string): string?
@@ -1622,21 +1857,62 @@ function Bridge:removePending(id: string)
 	end)
 end
 
+function Bridge.entryName(entry): string
+	local ok, name = pcall(function()
+		return HttpService:UrlDecode(entry.name)
+	end)
+	return if ok and type(name) == "string" then name else tostring(entry.name)
+end
+
 -- Edit side ------------------------------------------------------------------
+
+function Bridge:onMessage(msg, onRecording: (string) -> ())
+	if type(msg) ~= "string" then
+		return
+	end
+	if startsWith(msg, MSG_HELLO) then
+		Log.info("связь с тестом установлена")
+		return
+	end
+	if not startsWith(msg, MSG_PART) then
+		return
+	end
+	-- BBS_PART\n<id>\n<index>\n<count>\n<data>
+	local id, index, count, data = string.match(msg, "^BBS_PART\n([^\n]+)\n(%d+)\n(%d+)\n(.*)$")
+	if not id then
+		return
+	end
+	local i, n = tonumber(index), tonumber(count)
+	local entry = self.partial[id]
+	if not entry then
+		entry = { parts = {}, received = 0, count = n }
+		self.partial[id] = entry
+	end
+	if not entry.parts[i] then
+		entry.parts[i] = data
+		entry.received += 1
+	end
+	if entry.received >= entry.count then
+		self.partial[id] = nil
+		onRecording(table.concat(entry.parts, "", 1, entry.count))
+	end
+end
 
 function Bridge:listenFromTests(onRecording: (string) -> (), onChanged: () -> ())
 	local service = getService()
 	if not service then
+		Log.warn("PluginConnectionService недоступен — записи будут передаваться через резервное сохранение")
 		return
 	end
 	local testType
-	local ok = pcall(function()
+	local ok, err = pcall(function()
 		testType = Enum.PluginConnectionTargetType.Test
 		if not service:CanHaveConnectionType(testType) then
-			error("no test connections")
+			error("CanHaveConnectionType(Test) = false")
 		end
 	end)
 	if not ok then
+		Log.warn("связь с тестами недоступна (" .. tostring(err) .. ") — используется резервное сохранение")
 		return
 	end
 	local function bind(conn)
@@ -1644,9 +1920,7 @@ function Bridge:listenFromTests(onRecording: (string) -> (), onChanged: () -> ()
 			return
 		end
 		local binding = conn:BindToMessage(function(msg)
-			if type(msg) == "string" and startsWith(msg, MSG_REC) then
-				onRecording(string.sub(msg, #MSG_REC + 1))
-			end
+			self:onMessage(msg, onRecording)
 		end)
 		self.tests[conn] = binding
 		conn:GetPropertyChangedSignal("Connected"):Connect(function()
@@ -1685,7 +1959,7 @@ end
 
 -- Playtest side --------------------------------------------------------------
 
-function Bridge:connectToEdit(onConfig: (any) -> ())
+function Bridge:connectToEdit(onConfig: (any) -> (), onConnected: () -> ())
 	local service = getService()
 	if not service then
 		return
@@ -1714,23 +1988,34 @@ function Bridge:connectToEdit(onConfig: (any) -> ())
 					end
 				end
 			end)
+			conn:SendMessage(MSG_HELLO)
+			onConnected()
 		end)
 		if not ok then
-			warn("[BBS Studio] нет связи с редактором: " .. tostring(err))
+			Log.warn("нет связи с редактором: " .. tostring(err))
 		end
 	end)
 end
 
-function Bridge:sendToEdit(str: string): boolean
+function Bridge:isConnectedToEdit(): boolean
+	local conn = self.editConnection
+	return conn ~= nil and conn.Connected
+end
+
+function Bridge:sendToEdit(id: string, str: string): (boolean, string?)
 	local conn = self.editConnection
 	if not conn then
-		return false
+		return false, "нет соединения"
 	end
-	local ok = pcall(function()
-		assert(conn.Connected, "disconnected")
-		conn:SendMessage(MSG_REC .. str)
+	local ok, err = pcall(function()
+		assert(conn.Connected, "соединение закрыто")
+		local count = math.max(1, math.ceil(#str / PART_SIZE))
+		for i = 1, count do
+			local data = string.sub(str, (i - 1) * PART_SIZE + 1, i * PART_SIZE)
+			conn:SendMessage(MSG_PART .. id .. "\n" .. i .. "\n" .. count .. "\n" .. data)
+		end
 	end)
-	return ok
+	return ok, if ok then nil else tostring(err)
 end
 
 return Bridge
@@ -1773,6 +2058,7 @@ return History
           <string name="Name">PlayApp</string>
           <string name="Source"><![CDATA[--!nonstrict
 -- Playtest-client window: records the local character while the scene plays around it.
+-- Each take also becomes a local actor right away, so it can be previewed without leaving Play.
 local CoreGui = game:GetService("CoreGui")
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -1782,15 +2068,18 @@ local Shared = script.Parent.Parent.Shared
 local Codec = require(Shared.Codec)
 local SceneData = require(Shared.SceneData)
 local Playback = require(Shared.Playback)
+local Log = require(Shared.Log)
 
 local UI = require(script.Parent.UI)
 local Bridge = require(script.Parent.Bridge)
 local Recorder = require(script.Parent.Recorder)
+local Version = require(script.Parent.Version)
 
 local C = UI.C
 local SETTING_FPS = "BBS_RecordFPS"
 local SETTING_COUNTDOWN = "BBS_RecordCountdown"
 local SETTING_AUTO_OPEN = "BBS_AutoOpenRecorder"
+local SETTING_HUD = "BBS_ShowHud"
 
 local PlayApp = {}
 
@@ -1804,23 +2093,72 @@ local function getSetting(plugin: Plugin, key: string, default: any): any
 	return default
 end
 
-local function makeOverlay(): (ScreenGui, TextLabel)
+local function setSetting(plugin: Plugin, key: string, value: any)
+	pcall(function()
+		plugin:SetSetting(key, value)
+	end)
+end
+
+local function cloneCharacter(character: Model): Model?
+	local was = character.Archivable
+	character.Archivable = true
+	local ok, copy = pcall(function()
+		return character:Clone()
+	end)
+	character.Archivable = was
+	if not ok or not copy then
+		return nil
+	end
+	for _, d in copy:GetDescendants() do
+		if d:IsA("ForceField") or d:IsA("Sound") then
+			d:Destroy()
+		end
+	end
+	return copy
+end
+
+local function buildHud()
 	local gui = Instance.new("ScreenGui")
-	gui.Name = "BBS_RecordOverlay"
+	gui.Name = "BBS_RecordHud"
 	gui.IgnoreGuiInset = true
 	gui.ResetOnSpawn = false
 	gui.DisplayOrder = 1000
-	local label = Instance.new("TextLabel")
-	label.BackgroundTransparency = 1
-	label.AnchorPoint = Vector2.new(0.5, 0)
-	label.Position = UDim2.new(0.5, 0, 0, 40)
-	label.Size = UDim2.fromOffset(400, 60)
-	label.Font = UI.FONT_BOLD
-	label.TextSize = 36
-	label.TextColor3 = C.record
-	label.TextStrokeTransparency = 0.4
-	label.Text = ""
-	label.Parent = gui
+	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+	local bar = UI.new("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0),
+		Position = UDim2.new(0.5, 0, 0, 8),
+		Size = UDim2.fromOffset(0, 36),
+		AutomaticSize = Enum.AutomaticSize.X,
+		BackgroundColor3 = C.bg,
+		BackgroundTransparency = 0.15,
+		Parent = gui,
+	})
+	UI.corner(bar, 8)
+	UI.pad(bar, 6, 6, 6, 6)
+	UI.list(bar, true, 6)
+	local label = UI.label("BBS", {
+		Font = UI.FONT_BOLD,
+		TextSize = 16,
+		Size = UDim2.fromOffset(0, 24),
+		AutomaticSize = Enum.AutomaticSize.X,
+		Parent = bar,
+	})
+	local recordButton = UI.button("● Записать", nil, { Parent = bar, BackgroundColor3 = C.record, Font = UI.FONT_BOLD })
+	local previewButton = UI.button("▶ Просмотр", nil, { Parent = bar })
+
+	local countdown = UI.label("", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.4),
+		Size = UDim2.fromOffset(200, 120),
+		TextSize = 96,
+		Font = UI.FONT_BOLD,
+		TextColor3 = Color3.new(1, 1, 1),
+		TextStrokeTransparency = 0.3,
+		TextXAlignment = Enum.TextXAlignment.Center,
+		Parent = gui,
+	})
+
 	local ok = pcall(function()
 		gui.Parent = CoreGui
 	end)
@@ -1828,7 +2166,7 @@ local function makeOverlay(): (ScreenGui, TextLabel)
 		local player = Players.LocalPlayer
 		gui.Parent = player and player:FindFirstChildOfClass("PlayerGui")
 	end
-	return gui, label
+	return { gui = gui, label = label, record = recordButton, preview = previewButton, countdown = countdown }
 end
 
 function PlayApp.start(plugin: Plugin)
@@ -1836,28 +2174,33 @@ function PlayApp.start(plugin: Plugin)
 	local bridge = Bridge.new(plugin)
 	local recorder = Recorder.new()
 	local playback = Playback.new({ folderName = "BBS_LocalPuppets" })
-	local _, overlayLabel = makeOverlay()
+	playback.onError = function(text)
+		Log.error(text)
+	end
+	local hud = buildHud()
+	hud.gui.Enabled = getSetting(plugin, SETTING_HUD, true)
 
 	local state: string = "idle" -- idle | countdown | recording | preview
-	-- read through a function: the state is changed by other threads while the countdown waits
 	local function currentState(): string
 		return state
 	end
 	local config = { start = 0 }
 	local take = 1
-	local nameText = player and player.DisplayName or "Актёр"
+	local baseName = if player then player.DisplayName else "Актёр"
+	local nameText = baseName
 	local targetId = nil
 	local playScene = true
 	local sceneCamera = false
 	local session = {}
 	local timerConn = nil
 	local savedCameraType = nil
+	local connected = false
 
 	local toolbar = plugin:CreateToolbar("BBS Studio")
 	local button = toolbar:CreateButton("BBSStudioRecord", "Окно записи BBS Studio", "", "BBS запись")
 	button.ClickableWhenViewportHidden = true
 	local autoOpen = getSetting(plugin, SETTING_AUTO_OPEN, true)
-	local info = DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Float, autoOpen, autoOpen, 340, 520, 300, 300)
+	local info = DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Float, autoOpen, autoOpen, 360, 560, 300, 300)
 	local widget = UI.createWidget(plugin, "BBSStudio_Play", info)
 	widget.Title = "BBS Studio — запись"
 	widget.Name = "BBSStudioRecorder"
@@ -1883,12 +2226,26 @@ function PlayApp.start(plugin: Plugin)
 
 	local render -- forward declaration
 	local statusLabel, startBox
+	local statusText = if player and player.Character then "Готово к записи" else "Ждём персонажа…"
+	local statusColor = C.text
 
 	local function setStatus(text: string, color: Color3?)
+		statusText = text
+		statusColor = color or C.text
 		if statusLabel then
-			statusLabel.Text = text
-			statusLabel.TextColor3 = color or C.text
+			statusLabel.Text = statusText
+			statusLabel.TextColor3 = statusColor
 		end
+		hud.label.Text = statusText
+		hud.label.TextColor3 = statusColor
+	end
+
+	local function updateHud()
+		local busy = state == "countdown" or state == "recording"
+		hud.record.Text = if busy then "■ Стоп" else "● Записать"
+		UI.recolor(hud.record, if busy then C.panel2 else C.record)
+		hud.preview.Visible = not busy
+		hud.preview.Text = if state == "preview" then "■ Стоп просмотра" else "▶ Просмотр"
 	end
 
 	local function restoreCamera()
@@ -1899,12 +2256,14 @@ function PlayApp.start(plugin: Plugin)
 	end
 
 	local function startScene(from: number, useCamera: boolean)
-		if not SceneData.getRoot(false) then
+		local dataRoot = SceneData.getRoot(false)
+		if not dataRoot then
 			return
 		end
-		playback.exclude = if targetId then { [targetId] = true } else {}
-		playback.useCamera = useCamera
-		if useCamera then
+		playback.exclude = if targetId and state == "recording" then { [targetId] = true } else {}
+		local hasCamera = #SceneData.getCamera(dataRoot).keys > 0
+		playback.useCamera = useCamera and hasCamera
+		if playback.useCamera then
 			savedCameraType = Workspace.CurrentCamera.CameraType
 			Workspace.CurrentCamera.CameraType = Enum.CameraType.Scriptable
 		end
@@ -1917,10 +2276,29 @@ function PlayApp.start(plugin: Plugin)
 		restoreCamera()
 	end
 
+	local function addLocalTake(rec)
+		local dataRoot = SceneData.getRoot(true)
+		local target = if targetId then SceneData.findActor(dataRoot, targetId) else nil
+		if target then
+			SceneData.setRecording(target, rec)
+			target:SetAttribute("Offset", rec.offset or 0)
+			return
+		end
+		local character = player and player.Character
+		local skin = if character then cloneCharacter(character) else nil
+		local actor = SceneData.createActor(dataRoot, {
+			name = rec.name,
+			rec = rec,
+			skin = skin,
+			offset = rec.offset or 0,
+		})
+		actor:SetAttribute("BBS_LocalTake", true)
+	end
+
 	local function stopRecording()
 		if state == "countdown" then
 			state = "idle"
-			overlayLabel.Text = ""
+			hud.countdown.Text = ""
 			setStatus("Отменено", C.dim)
 			render()
 			return
@@ -1933,7 +2311,6 @@ function PlayApp.start(plugin: Plugin)
 			timerConn:Disconnect()
 			timerConn = nil
 		end
-		overlayLabel.Text = ""
 		local rec = recorder:stop()
 		stopScene()
 		if not rec or #rec.frames < 2 then
@@ -1945,16 +2322,33 @@ function PlayApp.start(plugin: Plugin)
 		rec.offset = config.start or 0
 		rec.target = targetId
 		local str = Codec.encodeRecording(rec)
-		local saved = bridge:savePending(rec, str)
-		local sent = bridge:sendToEdit(str)
-		table.insert(session, { name = rec.name, length = rec.length, sent = sent, saved = saved })
-		setStatus(
-			if sent then "✓ Отправлено в редактор" elseif saved then "Сохранено — импортируйте во вкладке «Запись»" else "Не удалось сохранить запись",
-			if sent or saved then C.good else C.danger
+		local saved, saveErr = bridge:savePending(rec, str)
+		local sent, sendErr = bridge:sendToEdit(rec.id, str)
+		local okLocal, localErr = pcall(addLocalTake, rec)
+		if not okLocal then
+			Log.error("не удалось показать дубль в тесте: " .. tostring(localErr))
+		end
+		Log.info(
+			string.format(
+				"дубль «%s»: %.1f с, %d кадров, %d суставов, %d КБ · редактор: %s · резерв: %s",
+				rec.name,
+				rec.length,
+				#rec.frames,
+				#rec.parts,
+				math.ceil(#str / 1024),
+				if sent then "отправлен" else "нет (" .. tostring(sendErr) .. ")",
+				if saved then "сохранён" else "ошибка (" .. tostring(saveErr) .. ")"
+			)
 		)
+		table.insert(session, { name = rec.name, length = rec.length, sent = sent, saved = saved })
+		if sent or saved then
+			setStatus("✓ Дубль готов — «▶ Просмотр»", C.good)
+		else
+			setStatus("× Запись не сохранена — см. Output", C.danger)
+		end
 		if not targetId then
 			take += 1
-			nameText = (player and player.DisplayName or "Актёр") .. " " .. take
+			nameText = baseName .. " " .. take
 		end
 		render()
 	end
@@ -1979,10 +2373,11 @@ function PlayApp.start(plugin: Plugin)
 				if currentState() ~= "countdown" then
 					return
 				end
-				setStatus(tostring(i) .. "…", C.warn)
-				overlayLabel.Text = tostring(i)
+				setStatus("Запись через " .. i .. "…", C.warn)
+				hud.countdown.Text = tostring(i)
 				task.wait(1)
 			end
+			hud.countdown.Text = ""
 			if currentState() ~= "countdown" then
 				return
 			end
@@ -1992,7 +2387,6 @@ function PlayApp.start(plugin: Plugin)
 			})
 			if not ok then
 				state = "idle"
-				overlayLabel.Text = ""
 				setStatus(err or "Ошибка", C.danger)
 				render()
 				return
@@ -2002,9 +2396,7 @@ function PlayApp.start(plugin: Plugin)
 				startScene(config.start or 0, sceneCamera)
 			end
 			timerConn = RunService.Heartbeat:Connect(function()
-				local text = "● REC " .. UI.formatTime(recorder.elapsed)
-				overlayLabel.Text = text
-				setStatus(text, C.record)
+				setStatus("● REC " .. UI.formatTime(recorder.elapsed), C.record)
 			end)
 			render()
 		end)
@@ -2023,8 +2415,14 @@ function PlayApp.start(plugin: Plugin)
 			stopScene()
 			state = "idle"
 		elseif state == "idle" then
+			local dataRoot = SceneData.getRoot(false)
+			if not dataRoot or #SceneData.listActors(dataRoot) == 0 then
+				setStatus("Смотреть пока нечего — запишите дубль", C.warn)
+				return
+			end
 			state = "preview"
-			startScene(config.start or 0, true)
+			startScene(0, true)
+			setStatus("▶ Просмотр сцены", C.accent)
 		end
 		render()
 	end
@@ -2033,20 +2431,27 @@ function PlayApp.start(plugin: Plugin)
 		if state == "preview" then
 			stopScene()
 			state = "idle"
+			setStatus("Просмотр окончен", C.dim)
 			render()
 		end
 	end
 
+	hud.record.Activated:Connect(toggleRecording)
+	hud.preview.Activated:Connect(togglePreview)
+
 	render = function()
+		updateHud()
 		UI.clear(root)
+		local busy = state == "countdown" or state == "recording"
 		local sec = UI.section("Запись актёра", root)
 		statusLabel = UI.label("", { Parent = sec, Font = UI.FONT_BOLD, TextSize = 18, Size = UDim2.new(1, 0, 0, 26) })
-		if state == "idle" then
-			setStatus(if player and player.Character then "Готово к записи" else "Ждём персонажа…", C.text)
-		elseif state == "preview" then
-			setStatus("▶ Просмотр сцены", C.accent)
-		end
-		local busy = state == "countdown" or state == "recording"
+		setStatus(statusText, statusColor)
+		UI.label(
+			if connected
+				then "● Связь с редактором есть"
+				else "○ Связи с редактором нет — записи сохраняются в резерв и подтянутся сами",
+			{ Parent = sec, TextSize = 12, TextColor3 = if connected then C.good else C.warn, TextWrapped = true, AutomaticSize = Enum.AutomaticSize.Y }
+		)
 
 		local nameRow = UI.row({}, { Parent = sec })
 		UI.label("Имя", { Parent = nameRow, Size = UDim2.fromOffset(60, 24), TextColor3 = C.dim })
@@ -2072,66 +2477,88 @@ function PlayApp.start(plugin: Plugin)
 				if actor then
 					nameText = SceneData.getName(actor)
 				end
+			else
+				nameText = baseName .. (if take > 1 then " " .. take else "")
 			end
 			render()
 		end, { Parent = targetRow, AutomaticSize = Enum.AutomaticSize.None, Size = UDim2.fromOffset(100, 24) }))
 
 		local startRow = UI.row({}, { Parent = sec })
-		UI.label("Старт сцены", { Parent = startRow, Size = UDim2.fromOffset(80, 24), TextColor3 = C.dim })
+		UI.label("Старт, с", { Parent = startRow, Size = UDim2.fromOffset(60, 24), TextColor3 = C.dim })
 		startBox = UI.textbox(UI.formatNumber(config.start or 0), function(text, box)
 			local v = UI.parseNumber(text)
 			config.start = math.max(0, v or config.start or 0)
 			box.Text = UI.formatNumber(config.start)
 		end, { Parent = startRow, Size = UDim2.fromOffset(50, 24) })
-		UI.label("с", { Parent = startRow, Size = UDim2.fromOffset(12, 24), TextColor3 = C.dim })
+		UI.label("время сцены, с которого начнётся дубль", {
+			Parent = startRow,
+			Size = UDim2.fromOffset(200, 24),
+			TextColor3 = C.dim,
+			TextSize = 12,
+		})
 
-		UI.toggle("Проигрывать сцену во время записи", playScene, function(v)
-			playScene = v
-		end, { Parent = sec })
-		UI.toggle("Камера сцены во время записи", sceneCamera, function(v)
-			sceneCamera = v
-		end, { Parent = sec })
+		UI.row({
+			UI.toggle("Сцена во время записи", playScene, function(v)
+				playScene = v
+			end),
+			UI.toggle("Камера сцены", sceneCamera, function(v)
+				sceneCamera = v
+			end),
+		}, { Parent = sec })
 
-		UI.button(if busy then "■  Стоп" else "●  Записать", function()
-			toggleRecording()
-		end, {
+		UI.button(if busy then "■  Стоп" else "●  Записать", toggleRecording, {
 			Parent = sec,
 			AutomaticSize = Enum.AutomaticSize.None,
-			Size = UDim2.new(1, 0, 0, 36),
+			Size = UDim2.new(1, 0, 0, 38),
 			TextSize = 18,
 			Font = UI.FONT_BOLD,
 			BackgroundColor3 = if busy then C.panel2 else C.record,
 		})
 		if not busy then
-			UI.button(if state == "preview" then "■ Остановить просмотр" else "▶ Просмотр сцены", togglePreview, {
+			UI.button(if state == "preview" then "■ Остановить просмотр" else "▶ Просмотр сцены (с камерой)", togglePreview, {
 				Parent = sec,
+				AutomaticSize = Enum.AutomaticSize.None,
+				Size = UDim2.new(1, 0, 0, 28),
 			})
 		end
-		UI.paragraph(
-			"Записи уходят в редактор и появляются как актёры после остановки теста. Горячая клавиша: File → Customize Shortcuts → «BBS: запись / стоп».",
-			{ Parent = sec }
-		)
 
 		if #session > 0 then
-			local list = UI.section("Записано в этом тесте", root)
+			local list = UI.section("Дубли в этом тесте", root)
 			for _, entry in session do
-				UI.label(
-					string.format(
-						"%s %s · %.1f с",
-						if entry.sent then "✓" elseif entry.saved then "•" else "×",
-						entry.name,
-						entry.length
-					),
-					{ Parent = list, TextSize = 13 }
-				)
+				local mark = if entry.sent then "✓ в редакторе" elseif entry.saved then "• в резерве" else "× не сохранён"
+				UI.label(string.format("%s · %.1f с · %s", entry.name, entry.length, mark), { Parent = list, TextSize = 13 })
 			end
+			UI.paragraph(
+				"Дубли уже играют в этом тесте. В редакторе они станут актёрами после остановки теста (Shift+F5).",
+				{ Parent = list }
+			)
 		end
-		local autoRow = UI.section(nil, root)
+
+		local settings = UI.section("Настройки", root)
+		local row = UI.row({}, { Parent = settings })
+		UI.label("Кадров/с", { Parent = row, Size = UDim2.fromOffset(58, 24), TextColor3 = C.dim })
+		UI.textbox(tostring(getSetting(plugin, SETTING_FPS, 30)), function(text, box)
+			local v = math.clamp(math.floor(UI.parseNumber(text) or 30), 5, 60)
+			setSetting(plugin, SETTING_FPS, v)
+			box.Text = tostring(v)
+		end, { Parent = row, Size = UDim2.fromOffset(40, 24) })
+		UI.label("Отсчёт, с", { Parent = row, Size = UDim2.fromOffset(62, 24), TextColor3 = C.dim })
+		UI.textbox(tostring(getSetting(plugin, SETTING_COUNTDOWN, 3)), function(text, box)
+			local v = math.clamp(math.floor(UI.parseNumber(text) or 3), 0, 10)
+			setSetting(plugin, SETTING_COUNTDOWN, v)
+			box.Text = tostring(v)
+		end, { Parent = row, Size = UDim2.fromOffset(40, 24) })
+		UI.toggle("Кнопки записи поверх игры", hud.gui.Enabled, function(v)
+			hud.gui.Enabled = v
+			setSetting(plugin, SETTING_HUD, v)
+		end, { Parent = settings })
 		UI.toggle("Открывать это окно при запуске теста", getSetting(plugin, SETTING_AUTO_OPEN, true), function(v)
-			pcall(function()
-				plugin:SetSetting(SETTING_AUTO_OPEN, v)
-			end)
-		end, { Parent = autoRow })
+			setSetting(plugin, SETTING_AUTO_OPEN, v)
+		end, { Parent = settings })
+		UI.paragraph(
+			"Горячие клавиши: File → Customize Shortcuts → «BBS: запись / стоп» и «BBS: просмотр». " .. Version.LABEL,
+			{ Parent = settings }
+		)
 	end
 
 	bridge:connectToEdit(function(cfg)
@@ -2140,6 +2567,11 @@ function PlayApp.start(plugin: Plugin)
 			if startBox and state == "idle" then
 				startBox.Text = UI.formatNumber(config.start)
 			end
+		end
+	end, function()
+		connected = true
+		if state == "idle" then
+			render()
 		end
 	end)
 
@@ -2152,11 +2584,20 @@ function PlayApp.start(plugin: Plugin)
 			true
 		)
 		action.Triggered:Connect(toggleRecording)
+		local previewAction = plugin:CreatePluginAction(
+			"BBSStudio_TogglePreview",
+			"BBS: просмотр",
+			"Проиграть сцену в тесте",
+			"",
+			true
+		)
+		previewAction.Triggered:Connect(togglePreview)
 	end)
 
 	if player then
 		player.CharacterAdded:Connect(function()
-			if state == "idle" then
+			if state == "idle" and #session == 0 then
+				setStatus("Готово к записи", C.text)
 				render()
 			end
 		end)
@@ -2165,6 +2606,7 @@ function PlayApp.start(plugin: Plugin)
 	plugin.Unloading:Connect(function()
 		recorder:stop()
 		stopScene()
+		hud.gui:Destroy()
 	end)
 
 	render()
@@ -2241,12 +2683,19 @@ function Recorder:start(opts): (boolean, string?)
 	local interval = 1 / fps
 	local nextSample = 0
 	local frames = self.rec.frames
+	local lastJoints = table.create(#motors, CFrame.identity)
+	local lastRoot = root.CFrame
 	local function sample()
-		local joints = table.create(#motors)
-		for i, motor in motors do
-			joints[i] = if motor.Parent then motor.Transform else CFrame.identity
+		-- after death or respawn the old parts are gone: hold the last pose
+		if root.Parent then
+			lastRoot = root.CFrame
+			local joints = table.create(#motors)
+			for i, motor in motors do
+				joints[i] = if motor.Parent then motor.Transform else lastJoints[i]
+			end
+			lastJoints = joints
 		end
-		table.insert(frames, { root = root.CFrame, joints = joints })
+		table.insert(frames, { root = lastRoot, joints = lastJoints })
 	end
 	sample()
 	nextSample = interval
@@ -2903,12 +3352,25 @@ return UI
 ]]></string>
         </Properties>
       </Item>
+      <Item class="ModuleScript" referent="10">
+        <Properties>
+          <string name="Name">Version</string>
+          <string name="Source"><![CDATA[--!nonstrict
+local Version = {}
+
+Version.NUMBER = "0.3.0"
+Version.LABEL = "BBS Studio v" .. Version.NUMBER
+
+return Version
+]]></string>
+        </Properties>
+      </Item>
     </Item>
-    <Item class="Folder" referent="10">
+    <Item class="Folder" referent="11">
       <Properties>
         <string name="Name">Shared</string>
       </Properties>
-      <Item class="ModuleScript" referent="11">
+      <Item class="ModuleScript" referent="12">
         <Properties>
           <string name="Name">CameraTrack</string>
           <string name="Source"><![CDATA[--!nonstrict
@@ -3039,7 +3501,7 @@ return CameraTrack
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="12">
+      <Item class="ModuleScript" referent="13">
         <Properties>
           <string name="Name">Codec</string>
           <string name="Source"><![CDATA[--!nonstrict
@@ -3049,8 +3511,22 @@ local HttpService = game:GetService("HttpService")
 
 local Codec = {}
 
-Codec.VERSION = 1
+Codec.VERSION = 2
 Codec.CHUNK_SIZE = 100000
+
+-- Headers are made pure ASCII ("~" marker + %XX escapes) so plugin settings and messages
+-- never have to carry non-ASCII text such as Cyrillic names.
+local function asciiEscape(s: string): string
+	return (string.gsub(s, "[%%\128-\255]", function(c)
+		return string.format("%%%02X", string.byte(c))
+	end))
+end
+
+local function asciiUnescape(s: string): string
+	return (string.gsub(s, "%%(%x%x)", function(h)
+		return string.char(tonumber(h, 16) :: number)
+	end))
+end
 
 local function fmt(n: number, pattern: string): string
 	if n ~= n then
@@ -3123,7 +3599,7 @@ function Codec.encodeRecording(rec): string
 		end
 		out[i] = table.concat(nums, ",")
 	end
-	return HttpService:JSONEncode(header) .. "\n" .. table.concat(out, ";")
+	return "~" .. asciiEscape(HttpService:JSONEncode(header)) .. "\n" .. table.concat(out, ";")
 end
 
 function Codec.decodeRecording(str: string)
@@ -3133,6 +3609,9 @@ function Codec.decodeRecording(str: string)
 	local nl = string.find(str, "\n", 1, true)
 	local headerStr = if nl then string.sub(str, 1, nl - 1) else str
 	local body = if nl then string.sub(str, nl + 1) else ""
+	if string.sub(headerStr, 1, 1) == "~" then
+		headerStr = asciiUnescape(string.sub(headerStr, 2))
+	end
 	local ok, header = pcall(function()
 		return HttpService:JSONDecode(headerStr)
 	end)
@@ -3261,12 +3740,58 @@ return Codec
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="13">
+      <Item class="ModuleScript" referent="14">
+        <Properties>
+          <string name="Name">Log</string>
+          <string name="Source"><![CDATA[--!nonstrict
+-- Small event log shown in the plugin and mirrored to Output.
+local Log = {}
+
+local MAX = 60
+Log.entries = {}
+Log.listeners = {}
+
+local function push(level: string, text: string)
+	table.insert(Log.entries, { time = os.time(), level = level, text = text })
+	if #Log.entries > MAX then
+		table.remove(Log.entries, 1)
+	end
+	if level == "error" or level == "warn" then
+		warn("[BBS Studio] " .. text)
+	else
+		print("[BBS Studio] " .. text)
+	end
+	for _, fn in Log.listeners do
+		task.spawn(fn)
+	end
+end
+
+function Log.info(text: string)
+	push("info", text)
+end
+
+function Log.warn(text: string)
+	push("warn", text)
+end
+
+function Log.error(text: string)
+	push("error", text)
+end
+
+function Log.onChanged(fn: () -> ())
+	table.insert(Log.listeners, fn)
+end
+
+return Log
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="15">
         <Properties>
           <string name="Name">Playback</string>
           <string name="Source"><![CDATA[--!nonstrict
 -- Drives puppets (and optionally the camera) from scene data. Used by the plugin in edit mode,
--- by the plugin inside a playtest while recording, and by the in-game player.
+-- by the plugin inside a playtest, and by the in-game player.
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
 
@@ -3278,10 +3803,14 @@ local SceneData = require(script.Parent.SceneData)
 local Playback = {}
 Playback.__index = Playback
 
+-- opts.folderName: puppet folder name; opts.parent: () -> Instance, where the folder lives.
 function Playback.new(opts)
 	opts = opts or {}
 	local self = setmetatable({}, Playback)
 	self.folderName = opts.folderName or "BBS_Puppets"
+	self.getParent = opts.parent or function()
+		return Workspace
+	end
 	self.puppets = {}
 	self.exclude = {}
 	self.time = 0
@@ -3290,21 +3819,27 @@ function Playback.new(opts)
 	self.useCamera = false
 	self.onTime = nil
 	self.onStopped = nil
+	self.onError = nil
+	self.errored = {}
 	return self
 end
 
 function Playback:getPuppetFolder(): Folder
+	local parent = self.getParent()
 	local f = self.puppetFolder
-	if f and f.Parent then
+	if f and f.Parent == parent then
 		return f
 	end
-	f = Workspace:FindFirstChild(self.folderName)
+	if f then
+		f:Destroy()
+	end
+	f = parent:FindFirstChild(self.folderName)
 	if not f then
 		f = Instance.new("Folder")
 		f.Name = self.folderName
 		-- puppets are regenerated from data: never saved with the place or copied into playtests
 		f.Archivable = false
-		f.Parent = Workspace
+		f.Parent = parent
 	end
 	self.puppetFolder = f
 	return f
@@ -3336,8 +3871,8 @@ function Playback:refresh()
 			self.puppets[actor] = nil
 		end
 	end
-	local folder = Workspace:FindFirstChild(self.folderName)
-	if folder then
+	local folder = self.puppetFolder
+	if folder and folder.Parent then
 		local tracked = {}
 		for _, state in self.puppets do
 			if state.model then
@@ -3358,10 +3893,12 @@ function Playback:invalidate(actor: Instance?)
 		if state then
 			self:clearPuppet(state)
 		end
+		self.errored[actor] = nil
 	else
 		for _, state in self.puppets do
 			self:clearPuppet(state)
 		end
+		self.errored = {}
 	end
 end
 
@@ -3387,12 +3924,30 @@ function Playback:ensureSkin(actor: Instance, state, skinName: string?): Model?
 	source.Archivable = true
 	local model = source:Clone()
 	source.Archivable = wasArchivable
+	if not model then
+		return nil
+	end
 	model.Name = SceneData.getName(actor)
 	model:SetAttribute("BBS_ActorId", actor.Name)
-	state.rig = Rig.prepare(model)
+	local rig = Rig.prepare(model)
+	if not rig then
+		model:Destroy()
+		error("в скине «" .. skinName .. "» нет ни одной детали (BasePart)", 0)
+	end
+	state.rig = rig
 	model.Parent = self:getPuppetFolder()
 	state.model = model
 	return model
+end
+
+-- Root CFrame of an actor at scene time t, straight from the recording.
+function Playback.actorRootAt(actor: Instance, t: number): CFrame?
+	local rec = SceneData.getRecording(actor)
+	if not rec then
+		return nil
+	end
+	local rel = t - (tonumber(actor:GetAttribute("Offset")) or 0)
+	return (Codec.sample(rec, rel))
 end
 
 function Playback:evaluateActor(actor: Instance, state, t: number)
@@ -3409,7 +3964,7 @@ function Playback:evaluateActor(actor: Instance, state, t: number)
 	end
 	local rootCf, joints = Codec.sample(rec, rel)
 	if rootCf then
-		Rig.apply(state.rig, model, rec.parts, rootCf, joints)
+		Rig.apply(state.rig, rec.parts, rootCf, joints)
 	end
 end
 
@@ -3420,8 +3975,15 @@ function Playback:evaluate(t: number)
 		for actor, state in self.puppets do
 			if actor.Parent then
 				local ok, err = pcall(self.evaluateActor, self, actor, state, t)
-				if not ok then
-					warn("[BBS Studio] " .. SceneData.getName(actor) .. ": " .. tostring(err))
+				if not ok and not self.errored[actor] then
+					-- report once per actor, not every frame
+					self.errored[actor] = true
+					local text = SceneData.getName(actor) .. ": " .. tostring(err)
+					if self.onError then
+						self.onError(text)
+					else
+						warn("[BBS Studio] " .. text)
+					end
 				end
 			end
 		end
@@ -3490,7 +4052,7 @@ function Playback:destroy()
 		self:clearPuppet(state)
 	end
 	self.puppets = {}
-	if self.puppetFolder and #self.puppetFolder:GetChildren() == 0 then
+	if self.puppetFolder then
 		self.puppetFolder:Destroy()
 	end
 	self.puppetFolder = nil
@@ -3500,12 +4062,15 @@ return Playback
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="14">
+      <Item class="ModuleScript" referent="16">
         <Properties>
           <string name="Name">Rig</string>
           <string name="Source"><![CDATA[--!nonstrict
--- Applying recorded poses to arbitrary models ("skins"). Joints are matched by Part1 name,
--- so any rig with the same part names as the recorded character can play the recording.
+-- Puppets: every part is anchored, joints are disabled and part CFrames are computed here
+-- (forward kinematics over the joint tree). Motor6D.Transform is only applied by the physics
+-- step, which never runs in edit mode, so poses must not rely on the engine solving joints.
+local Workspace = game:GetService("Workspace")
+
 local Rig = {}
 
 local function insideAccessory(inst: Instance, model: Instance): boolean
@@ -3519,6 +4084,7 @@ local function insideAccessory(inst: Instance, model: Instance): boolean
 	return false
 end
 
+-- Body joints used for recording, keyed by Part1 name.
 function Rig.getJoints(model: Instance): { [string]: Motor6D }
 	local map = {}
 	for _, d in model:GetDescendants() do
@@ -3529,78 +4095,208 @@ function Rig.getJoints(model: Instance): { [string]: Motor6D }
 	return map
 end
 
-function Rig.inspect(model: Model)
-	local humanoid = model:FindFirstChildOfClass("Humanoid")
+function Rig.findRoot(model: Model): BasePart?
 	local hrp = model:FindFirstChild("HumanoidRootPart")
-	local root = if hrp and hrp:IsA("BasePart") then hrp else model.PrimaryPart
-	return {
-		root = root,
-		humanoid = humanoid,
-		-- humanoid rigs move by their root part; props are moved by pivot
-		useRootPart = humanoid ~= nil and root ~= nil,
-		joints = Rig.getJoints(model),
-	}
+	if hrp and hrp:IsA("BasePart") then
+		return hrp
+	end
+	if model.PrimaryPart then
+		return model.PrimaryPart
+	end
+	return model:FindFirstChildWhichIsA("BasePart", true)
 end
 
 function Rig.getRootCFrame(model: Model): CFrame
-	local info = Rig.inspect(model)
-	if info.useRootPart then
-		return info.root.CFrame
-	end
-	return model:GetPivot()
+	local root = Rig.findRoot(model)
+	return if root then root.CFrame else model:GetPivot()
 end
 
--- Turns a cloned skin into a script-free puppet driven only by the playback.
-function Rig.prepare(model: Model)
+-- Removes scripts so stored skins and puppets never run code (and stay replicable in Team Create).
+function Rig.sanitize(model: Instance)
 	for _, d in model:GetDescendants() do
-		if d:IsA("LuaSourceContainer") or d:IsA("Animator") then
+		if d:IsA("LuaSourceContainer") then
 			d:Destroy()
 		end
 	end
-	local info = Rig.inspect(model)
-	if info.humanoid then
-		pcall(function()
-			info.humanoid.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
-			info.humanoid.BreakJointsOnDeath = false
-			info.humanoid.RequiresNeck = false
-		end)
-	end
-	if info.root then
-		model.PrimaryPart = info.root
-	end
-	for _, d in model:GetDescendants() do
-		if d:IsA("BasePart") then
-			d.CanCollide = false
-			d.CanTouch = false
-			d.Anchored = if info.useRootPart then d == info.root else true
-		end
-	end
-	return info
 end
 
-function Rig.apply(info, model: Model, parts: { string }, rootCf: CFrame, joints: { CFrame }?)
-	if info.useRootPart then
-		info.root.CFrame = rootCf
-	else
-		model:PivotTo(rootCf)
+local function jointParts(j: Instance): (BasePart?, BasePart?)
+	local p0, p1
+	if j:IsA("JointInstance") or j:IsA("WeldConstraint") then
+		p0, p1 = (j :: any).Part0, (j :: any).Part1
+	elseif j:IsA("RigidConstraint") then
+		local a0, a1 = j.Attachment0, j.Attachment1
+		p0 = a0 and a0.Parent
+		p1 = a1 and a1.Parent
 	end
-	if joints then
-		local map = info.joints
-		for i, name in parts do
-			local motor = map[name]
-			local cf = joints[i]
-			if motor and cf then
-				motor.Transform = cf
+	if p0 and p1 and p0:IsA("BasePart") and p1:IsA("BasePart") then
+		return p0, p1
+	end
+	return nil, nil
+end
+
+-- Offset of `child` relative to `parent` for a rigid joint, from the joint's own data when possible.
+local function rigidOffset(j: Instance, parent: BasePart, child: BasePart): CFrame
+	if j:IsA("JointInstance") then
+		local c0, c1 = (j :: any).C0, (j :: any).C1
+		if (j :: any).Part0 == parent then
+			return c0 * c1:Inverse()
+		end
+		return c1 * c0:Inverse()
+	elseif j:IsA("RigidConstraint") then
+		local a0, a1 = j.Attachment0, j.Attachment1
+		if a0.Parent == parent then
+			return a0.CFrame * a1.CFrame:Inverse()
+		end
+		return a1.CFrame * a0.CFrame:Inverse()
+	end
+	return parent.CFrame:ToObjectSpace(child.CFrame)
+end
+
+-- Turns a cloned skin into a puppet and returns its kinematic description.
+function Rig.prepare(model: Model)
+	Rig.sanitize(model)
+	for _, d in model:GetDescendants() do
+		if d:IsA("Animator") then
+			d:Destroy()
+		end
+	end
+	local humanoid = model:FindFirstChildOfClass("Humanoid")
+	if humanoid then
+		pcall(function()
+			humanoid.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+			humanoid.HealthDisplayType = Enum.HumanoidHealthDisplayType.AlwaysOff
+			humanoid.BreakJointsOnDeath = false
+			humanoid.RequiresNeck = false
+			humanoid.EvaluateStateMachine = false
+		end)
+	end
+	local root = Rig.findRoot(model)
+	if not root then
+		return nil
+	end
+	model.PrimaryPart = root
+
+	local parts = {}
+	local inModel = {}
+	for _, d in model:GetDescendants() do
+		if d:IsA("BasePart") then
+			table.insert(parts, d)
+			inModel[d] = true
+		end
+	end
+
+	local edges = {}
+	local joints = {}
+	for _, d in model:GetDescendants() do
+		local p0, p1 = jointParts(d)
+		if p0 and inModel[p0] and inModel[p1] then
+			table.insert(joints, d)
+			edges[p0] = edges[p0] or {}
+			edges[p1] = edges[p1] or {}
+			table.insert(edges[p0], { other = p1, joint = d })
+			table.insert(edges[p1], { other = p0, joint = d })
+		end
+	end
+
+	-- breadth-first from the root so every parent is solved before its children
+	local nodes = {}
+	local visited = { [root] = true }
+	local queue = { root }
+	local head = 1
+	while head <= #queue do
+		local current = queue[head]
+		head += 1
+		for _, edge in edges[current] or {} do
+			local other, j = edge.other, edge.joint
+			if not visited[other] then
+				visited[other] = true
+				table.insert(queue, other)
+				local node = { part = other, parent = current }
+				if j:IsA("Motor6D") and not insideAccessory(j, model) then
+					node.motor = true
+					node.name = j.Part1.Name
+					node.invert = j.Part0 ~= current
+					node.c0 = j.C0
+					node.c1 = j.C1
+				else
+					node.offset = rigidOffset(j, current, other)
+				end
+				table.insert(nodes, node)
 			end
 		end
 	end
+	for _, part in parts do
+		if not visited[part] then
+			table.insert(nodes, { part = part, parent = root, offset = root.CFrame:ToObjectSpace(part.CFrame) })
+		end
+	end
+
+	for _, j in joints do
+		pcall(function()
+			(j :: any).Enabled = false
+		end)
+	end
+	for _, part in parts do
+		part.Anchored = true
+		part.CanCollide = false
+		part.CanTouch = false
+	end
+
+	local partList = { root }
+	for i, node in nodes do
+		partList[i + 1] = node.part
+	end
+	return {
+		root = root,
+		humanoid = humanoid,
+		nodes = nodes,
+		partList = partList,
+		cframes = table.create(#partList),
+		solved = {},
+		mappedParts = nil,
+	}
+end
+
+function Rig.apply(info, recParts: { string }, rootCf: CFrame, joints: { CFrame }?)
+	if info.mappedParts ~= recParts then
+		local index = {}
+		for i, name in recParts do
+			index[name] = i
+		end
+		for _, node in info.nodes do
+			node.recIndex = if node.motor then index[node.name] else nil
+		end
+		info.mappedParts = recParts
+	end
+	local solved = info.solved
+	local cframes = info.cframes
+	solved[info.root] = rootCf
+	cframes[1] = rootCf
+	for i, node in info.nodes do
+		local parentCf = solved[node.parent] or rootCf
+		local cf
+		if node.motor then
+			local t = (joints and node.recIndex and joints[node.recIndex]) or CFrame.identity
+			if node.invert then
+				cf = parentCf * node.c1 * t:Inverse() * node.c0:Inverse()
+			else
+				cf = parentCf * node.c0 * t * node.c1:Inverse()
+			end
+		else
+			cf = parentCf * node.offset
+		end
+		solved[node.part] = cf
+		cframes[i + 1] = cf
+	end
+	Workspace:BulkMoveTo(info.partList, cframes, Enum.BulkMoveMode.FireCFrameChanged)
 end
 
 return Rig
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="15">
+      <Item class="ModuleScript" referent="17">
         <Properties>
           <string name="Name">RuntimePlayer</string>
           <string name="Source"><![CDATA[--!nonstrict
@@ -3734,7 +4430,7 @@ return RuntimePlayer
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="16">
+      <Item class="ModuleScript" referent="18">
         <Properties>
           <string name="Name">SceneData</string>
           <string name="Source"><![CDATA[--!nonstrict
@@ -3750,6 +4446,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local Codec = require(script.Parent.Codec)
 local CameraTrack = require(script.Parent.CameraTrack)
+local Rig = require(script.Parent.Rig)
 
 local SceneData = {}
 
@@ -3919,6 +4616,8 @@ function SceneData.addSkin(actor: Instance, model: Model, name: string?): string
 		unique = base .. " " .. n
 	end
 	model.Name = unique
+	model.Archivable = true
+	Rig.sanitize(model)
 	model.Parent = folder
 	local default = actor:GetAttribute("DefaultSkin")
 	if not default or not SceneData.getSkin(actor, default) then

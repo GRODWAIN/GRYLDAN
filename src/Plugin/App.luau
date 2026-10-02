@@ -13,12 +13,14 @@ local CameraTrack = require(Shared.CameraTrack)
 local Rig = require(Shared.Rig)
 local SceneData = require(Shared.SceneData)
 local Playback = require(Shared.Playback)
+local Log = require(Shared.Log)
 
 local UI = require(script.Parent.UI)
 local Timeline = require(script.Parent.Timeline)
 local History = require(script.Parent.History)
 local Appearance = require(script.Parent.Appearance)
 local Bridge = require(script.Parent.Bridge)
+local Version = require(script.Parent.Version)
 
 local C = UI.C
 local GAP = 6
@@ -37,6 +39,7 @@ require(ReplicatedStorage:WaitForChild("BBS_Runtime"):WaitForChild("RuntimePlaye
 local SETTING_FPS = "BBS_RecordFPS"
 local SETTING_COUNTDOWN = "BBS_RecordCountdown"
 local SETTING_FROM_CURSOR = "BBS_RecordFromCursor"
+local AUTO_IMPORT_MAX_AGE = 6 * 3600
 
 local TABS = {
 	{ id = "actors", label = "Актёры" },
@@ -83,21 +86,33 @@ function App.start(plugin: Plugin)
 	self.lastPendingCount = -1
 	self.connections = {}
 	self.bridge = Bridge.new(plugin)
+	self.showPath = false
+	self.pathKey = nil
 
-	self.playback = Playback.new({ folderName = "BBS_Puppets" })
+	-- Camera children are local to this Studio window: previews are not replicated to Team Create
+	-- collaborators and are never saved.
+	self.playback = Playback.new({
+		folderName = "BBS_Puppets",
+		parent = function()
+			return Workspace.CurrentCamera
+		end,
+	})
 	self.playback.onTime = function(t)
 		self:onTime(t)
 	end
 	self.playback.onStopped = function()
 		self:updateTransport()
 	end
+	self.playback.onError = function(text)
+		Log.error(text)
+	end
 
 	local toolbar = plugin:CreateToolbar("BBS Studio")
 	self.button = toolbar:CreateButton("BBSStudioOpen", "BBS Studio — съёмка машинимы", "", "BBS Studio")
 	self.button.ClickableWhenViewportHidden = true
-	local info = DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Right, false, false, 460, 680, 380, 360)
+	local info = DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Right, false, false, 470, 700, 380, 360)
 	self.widget = UI.createWidget(plugin, "BBSStudio_Edit", info)
-	self.widget.Title = "BBS Studio"
+	self.widget.Title = Version.LABEL
 	self.widget.Name = "BBSStudio"
 	self.widget.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 	self.button.Click:Connect(function()
@@ -128,6 +143,12 @@ function App.start(plugin: Plugin)
 	end, function()
 		self:onTestsChanged()
 	end)
+	self:createActions()
+	Log.onChanged(function()
+		if self.tab == "scene" and self.alive then
+			self:render()
+		end
+	end)
 
 	task.spawn(function()
 		while self.alive do
@@ -137,6 +158,7 @@ function App.start(plugin: Plugin)
 			end
 			if not self.bridge:hasActiveTests() then
 				self:processQueue()
+				self:autoImportPending()
 			end
 			local count = #self.bridge:getPendingIndex() + #self.importQueue
 			if count ~= self.lastPendingCount then
@@ -151,10 +173,17 @@ function App.start(plugin: Plugin)
 	plugin.Unloading:Connect(function()
 		self.alive = false
 		self.playback:destroy()
+		self:clearPath()
 		for _, conn in self.connections do
 			conn:Disconnect()
 		end
 	end)
+
+	-- leftovers of v0.1, which kept puppets in Workspace
+	local legacy = Workspace:FindFirstChild("BBS_Puppets")
+	if legacy and not legacy.Archivable then
+		legacy:Destroy()
+	end
 
 	if SceneData.getRoot(false) then
 		self.playback:refresh()
@@ -162,6 +191,25 @@ function App.start(plugin: Plugin)
 	end
 	self:render()
 	return self
+end
+
+function App:createActions()
+	local plugin = self.plugin
+	pcall(function()
+		plugin:CreatePluginAction("BBSStudio_PlayPause", "BBS: воспроизведение / пауза", "Проиграть сцену BBS Studio", "", true).Triggered
+			:Connect(function()
+				self:togglePlay()
+			end)
+		plugin:CreatePluginAction("BBSStudio_CameraKey", "BBS: ключ камеры", "Добавить ключ камеры из текущего вида", "", true).Triggered
+			:Connect(function()
+				self:addCameraKey()
+			end)
+		plugin:CreatePluginAction("BBSStudio_ToStart", "BBS: в начало", "Перемотать сцену в начало", "", true).Triggered
+			:Connect(function()
+				self:pausePlayback()
+				self:seek(0)
+			end)
+	end)
 end
 
 -- Layout ---------------------------------------------------------------------
@@ -385,9 +433,9 @@ function App:setUseCamera(v: boolean)
 end
 
 function App:onSelectionChanged()
-	local folder = Workspace:FindFirstChild("BBS_Puppets")
+	local folder = self.playback.puppetFolder
 	local root = SceneData.getRoot(false)
-	if not folder or not root then
+	if not folder or not folder.Parent or not root then
 		return
 	end
 	for _, obj in Selection:Get() do
@@ -427,6 +475,111 @@ function App:render()
 	self.timeline:rebuild()
 	self:onTime(self.playback.time)
 	self:updateTransport()
+	self:updatePath()
+end
+
+-- Viewport helpers ------------------------------------------------------------
+
+function App:focusActor(actor: Instance)
+	local rec = SceneData.getRecording(actor)
+	if not rec then
+		self:toast("У актёра нет записи", C.warn)
+		return
+	end
+	local offset = tonumber(actor:GetAttribute("Offset")) or 0
+	local t = self.playback.time
+	if t < offset or t > offset + rec.length then
+		self:pausePlayback()
+		self:seek(offset)
+	end
+	local cf = Playback.actorRootAt(actor, self.playback.time)
+	if not cf then
+		return
+	end
+	self:setUseCamera(false)
+	local pos = cf.Position
+	local look = cf.LookVector * Vector3.new(1, 0, 1)
+	if look.Magnitude < 1e-3 then
+		look = Vector3.new(0, 0, -1)
+	end
+	local from = pos + look.Unit * 12 + Vector3.new(0, 4, 0)
+	local cam = Workspace.CurrentCamera
+	cam.CFrame = CFrame.lookAt(from, pos)
+	cam.Focus = CFrame.new(pos)
+	if not self.playback:getPuppet(actor) then
+		local skin = SceneData.skinAt(actor, self.playback.time - offset)
+		if not skin or not SceneData.getSkin(actor, skin) then
+			self:toast("Камера наведена, но у актёра нет скина в этот момент — добавьте скин", C.warn)
+			return
+		end
+	end
+	self:toast("Камера наведена на «" .. SceneData.getName(actor) .. "»", C.good)
+end
+
+function App:clearPath()
+	local cam = Workspace.CurrentCamera
+	local folder = cam and cam:FindFirstChild("BBS_Path")
+	if folder then
+		folder:Destroy()
+	end
+	self.pathKey = nil
+end
+
+-- Draws the selected actor's root trajectory as a dotted line in the viewport.
+function App:updatePath()
+	local actor = self.selected
+	if not self.showPath or not actor or not actor.Parent then
+		self:clearPath()
+		return
+	end
+	local rec = SceneData.getRecording(actor)
+	local key = actor.Name .. ":" .. tostring(actor:GetAttribute("RecVersion"))
+	if not rec or key == self.pathKey then
+		return
+	end
+	self:clearPath()
+	self.pathKey = key
+	local folder = Instance.new("Folder")
+	folder.Name = "BBS_Path"
+	folder.Archivable = false
+	local color = actor:GetAttribute("Color") or C.accent
+	local step = math.max(1, math.floor(#rec.frames / 200))
+	for i = 1, #rec.frames, step do
+		local dot = Instance.new("Part")
+		dot.Shape = Enum.PartType.Ball
+		dot.Size = Vector3.new(0.35, 0.35, 0.35)
+		dot.Material = Enum.Material.Neon
+		dot.Color = color
+		dot.Anchored = true
+		dot.CanCollide = false
+		dot.CanTouch = false
+		dot.CanQuery = false
+		dot.CastShadow = false
+		dot.CFrame = CFrame.new(rec.frames[i].root.Position)
+		dot.Parent = folder
+	end
+	folder.Parent = Workspace.CurrentCamera
+end
+
+function App:autoImportPending()
+	local now = os.time()
+	local place = Bridge.placeKey()
+	for _, entry in self.bridge:getPendingIndex() do
+		local fresh = type(entry.time) == "number" and now - entry.time < AUTO_IMPORT_MAX_AGE
+		if entry.place == place and fresh and not self.importing[entry.id] then
+			local str = self.bridge:loadPending(entry.id)
+			if str then
+				Log.info("импорт из резервного сохранения: «" .. Bridge.entryName(entry) .. "»")
+				local ok, err = pcall(self.importRecordingString, self, str)
+				if not ok then
+					Log.error("импорт не удался: " .. tostring(err))
+					self.bridge:removePending(entry.id)
+				end
+			else
+				self.bridge:removePending(entry.id)
+			end
+		end
+	end
 end
 
 -- Actors tab -----------------------------------------------------------------
@@ -513,6 +666,9 @@ function App:renderActorRow(parent: Instance, actor: Instance)
 	UI.button("⧉", function()
 		self:duplicateActor(actor)
 	end, { Parent = row })
+	UI.button("◎", function()
+		self:focusActor(actor)
+	end, { Parent = row })
 	UI.button("×", function()
 		if self.selected == actor then
 			self.selected = nil
@@ -549,8 +705,12 @@ function App:renderActorDetails(actor: Instance)
 				Selection:Set({ puppet })
 			end
 		end),
-		UI.button("Показать данные", function()
-			Selection:Set({ actor })
+		UI.button("◎ Навести камеру", function()
+			self:focusActor(actor)
+		end),
+		UI.toggle("Траектория", self.showPath, function(v)
+			self.showPath = v
+			self:updatePath()
 		end),
 	}, { Parent = sec })
 
@@ -977,9 +1137,9 @@ function App:renderRecord()
 	local sec = UI.section("Запись актёра", self.content)
 	UI.paragraph(
 		"1. Нажмите Play (F5). В тесте откроется окно «BBS Studio — запись».\n"
-			.. "2. Выберите цель (новый актёр или перезапись старого) и нажмите «● Записать». После отсчёта играйте: записываются позиция и вся анимация персонажа. Уже записанные актёры и камера проигрываются одновременно — можно играть сцену «в паре» с прошлыми дублями.\n"
-			.. "3. Нажмите «■ Стоп». Для горячей клавиши назначьте действие «BBS: запись / стоп» в File → Customize Shortcuts.\n"
-			.. "4. Остановите тест — записи станут актёрами с вашим аватаром.",
+			.. "2. Нажмите «● Записать» (в окне или в панели сверху экрана игры). После отсчёта играйте: записываются позиция и вся анимация персонажа.\n"
+			.. "3. Нажмите «■ Стоп». Дубль сразу появится в тесте — «▶ Просмотр» покажет его. Следующие дубли записываются рядом с прошлыми.\n"
+			.. "4. Остановите тест (Shift+F5) — дубли станут актёрами здесь, камера наведётся на нового актёра.",
 		{ Parent = sec, TextColor3 = C.text }
 	)
 	local row = UI.row({}, { Parent = sec })
@@ -1034,7 +1194,9 @@ function App:renderRecord()
 	for _, entry in pending do
 		local r = UI.row({}, { Parent = backup })
 		local when = if entry.time then os.date("%d.%m %H:%M", entry.time) else ""
-		UI.flex(UI.label(string.format("%s · %.1f с · %s", tostring(entry.name), entry.length or 0, when), {
+		local other = entry.place ~= Bridge.placeKey()
+		local label = string.format("%s · %.1f с · %s", Bridge.entryName(entry), entry.length or 0, when)
+		UI.flex(UI.label(label .. (if other then " · другой плейс" else ""), {
 			Parent = r,
 			Size = UDim2.fromOffset(80, 24),
 		}))
@@ -1079,7 +1241,7 @@ function App:processQueue()
 		local str = table.remove(self.importQueue, 1)
 		local ok, err = pcall(self.importRecordingString, self, str)
 		if not ok then
-			warn("[BBS Studio] импорт не удался: " .. tostring(err))
+			Log.error("импорт не удался: " .. tostring(err))
 		end
 	end
 	self.processing = false
@@ -1088,7 +1250,7 @@ end
 function App:importRecordingString(str: string)
 	local rec = Codec.decodeRecording(str)
 	if not rec or #rec.frames == 0 then
-		self:toast("Повреждённая запись", C.warn)
+		Log.error("получена повреждённая запись (" .. #str .. " байт)")
 		return
 	end
 	if self.importing[rec.id] then
@@ -1114,11 +1276,17 @@ function App:importRecordingString(str: string)
 	if not target then
 		self:toast("Создаю актёра «" .. rec.name .. "»…")
 		local ok, model = pcall(Appearance.rigForRecording, rec)
-		if ok then
+		if ok and model then
 			skin = model
 			skin.Name = rec.name
 		else
-			warn("[BBS Studio] не удалось создать скин: " .. tostring(model))
+			Log.error(
+				"не удалось загрузить аватар для «"
+					.. rec.name
+					.. "»: "
+					.. tostring(model)
+					.. ". Добавьте скин вручную: «+ Скин из выделенной модели»."
+			)
 		end
 	end
 
@@ -1139,11 +1307,14 @@ function App:importRecordingString(str: string)
 	end)
 	if ok then
 		self.bridge:removePending(rec.id)
-		self:toast("Запись «" .. rec.name .. "» добавлена", C.good)
+		Log.info(string.format("актёр «%s» добавлен: %.1f с, %d кадров", rec.name, rec.length, #rec.frames))
 		self.tab = "actors"
 	end
 	self.importing[rec.id] = nil
 	self:onDataChanged()
+	if ok and self.selected then
+		self:focusActor(self.selected)
+	end
 end
 
 -- Scene tab ------------------------------------------------------------------
@@ -1276,6 +1447,43 @@ function App:renderScene()
 			end)
 		end),
 	}, { Parent = player })
+
+	self:renderDiagnostics()
+end
+
+function App:renderDiagnostics()
+	local sec = UI.section("Диагностика", self.content)
+	local root = SceneData.getRoot(false)
+	local actors = if root then SceneData.listActors(root) else {}
+	local puppets = 0
+	for _, actor in actors do
+		if self.playback:getPuppet(actor) then
+			puppets += 1
+		end
+	end
+	local lines = {
+		Version.LABEL,
+		"Связь с тестами: " .. (if self.bridge.available then "PluginConnectionService" else "только резервное сохранение"),
+		"Активных тестов: " .. (if self.bridge:hasActiveTests() then "есть" else "нет"),
+		string.format("Актёров: %d · видимых марионеток сейчас: %d", #actors, puppets),
+		"Ожидают импорта: " .. (#self.bridge:getPendingIndex() + #self.importQueue),
+	}
+	for _, line in lines do
+		UI.label(line, { Parent = sec, TextSize = 13, TextColor3 = C.dim })
+	end
+	UI.label("Журнал", { Parent = sec, Font = UI.FONT_BOLD })
+	local entries = Log.entries
+	if #entries == 0 then
+		UI.label("пусто", { Parent = sec, TextSize = 12, TextColor3 = C.dim })
+	end
+	for i = #entries, math.max(1, #entries - 19), -1 do
+		local e = entries[i]
+		UI.paragraph(os.date("%H:%M:%S", e.time) .. "  " .. e.text, {
+			Parent = sec,
+			TextSize = 12,
+			TextColor3 = if e.level == "error" then C.danger elseif e.level == "warn" then C.warn else C.text,
+		})
+	end
 end
 
 function App:installRuntime()

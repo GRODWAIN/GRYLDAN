@@ -1,15 +1,21 @@
 --!nonstrict
 -- Moves recordings from the playtest client back to the edit session.
--- Primary path: PluginConnectionService. Backup: plugin settings, which survive the playtest.
+-- Channel 1: PluginConnectionService messages (split into parts).
+-- Channel 2: plugin settings, which outlive the playtest; the edit side polls and imports them.
 local HttpService = game:GetService("HttpService")
+
+local Log = require(script.Parent.Parent.Shared.Log)
 
 local Bridge = {}
 Bridge.__index = Bridge
 
-local INDEX_KEY = "BBS_PendingIndex"
-local REC_PREFIX = "BBS_Rec_"
-local MSG_REC = "BBS_REC\n"
+local INDEX_KEY = "BBS_PendingIndex2"
+local REC_PREFIX = "BBS_Rec2_"
+local MSG_PART = "BBS_PART\n"
 local MSG_CFG = "BBS_CFG\n"
+local MSG_HELLO = "BBS_HELLO\n"
+local PART_SIZE = 60000
+local MAX_PENDING = 30
 
 local function getService()
 	local ok, service = pcall(function()
@@ -22,11 +28,21 @@ local function startsWith(s: string, prefix: string): boolean
 	return string.sub(s, 1, #prefix) == prefix
 end
 
+-- Identifies the place so backups recorded in one place are not auto-imported into another.
+function Bridge.placeKey(): string
+	if game.PlaceId ~= 0 then
+		return "id:" .. tostring(game.PlaceId)
+	end
+	return "local"
+end
+
 function Bridge.new(plugin: Plugin)
 	local self = setmetatable({}, Bridge)
 	self.plugin = plugin
 	self.tests = {}
+	self.partial = {}
 	self.editConnection = nil
+	self.available = getService() ~= nil
 	return self
 end
 
@@ -42,13 +58,24 @@ function Bridge:getPendingIndex()
 	return index
 end
 
-function Bridge:savePending(rec, str: string): boolean
-	return (pcall(function()
+function Bridge:savePending(rec, str: string): (boolean, string?)
+	local ok, err = pcall(function()
 		self.plugin:SetSetting(REC_PREFIX .. rec.id, str)
 		local index = self:getPendingIndex()
-		table.insert(index, { id = rec.id, name = rec.name, length = rec.length, time = os.time() })
+		table.insert(index, {
+			id = rec.id,
+			name = HttpService:UrlEncode(rec.name),
+			length = rec.length,
+			time = os.time(),
+			place = Bridge.placeKey(),
+		})
+		while #index > MAX_PENDING do
+			local old = table.remove(index, 1)
+			self.plugin:SetSetting(REC_PREFIX .. old.id, nil)
+		end
 		self.plugin:SetSetting(INDEX_KEY, index)
-	end))
+	end)
+	return ok, if ok then nil else tostring(err)
 end
 
 function Bridge:loadPending(id: string): string?
@@ -71,21 +98,62 @@ function Bridge:removePending(id: string)
 	end)
 end
 
+function Bridge.entryName(entry): string
+	local ok, name = pcall(function()
+		return HttpService:UrlDecode(entry.name)
+	end)
+	return if ok and type(name) == "string" then name else tostring(entry.name)
+end
+
 -- Edit side ------------------------------------------------------------------
+
+function Bridge:onMessage(msg, onRecording: (string) -> ())
+	if type(msg) ~= "string" then
+		return
+	end
+	if startsWith(msg, MSG_HELLO) then
+		Log.info("связь с тестом установлена")
+		return
+	end
+	if not startsWith(msg, MSG_PART) then
+		return
+	end
+	-- BBS_PART\n<id>\n<index>\n<count>\n<data>
+	local id, index, count, data = string.match(msg, "^BBS_PART\n([^\n]+)\n(%d+)\n(%d+)\n(.*)$")
+	if not id then
+		return
+	end
+	local i, n = tonumber(index), tonumber(count)
+	local entry = self.partial[id]
+	if not entry then
+		entry = { parts = {}, received = 0, count = n }
+		self.partial[id] = entry
+	end
+	if not entry.parts[i] then
+		entry.parts[i] = data
+		entry.received += 1
+	end
+	if entry.received >= entry.count then
+		self.partial[id] = nil
+		onRecording(table.concat(entry.parts, "", 1, entry.count))
+	end
+end
 
 function Bridge:listenFromTests(onRecording: (string) -> (), onChanged: () -> ())
 	local service = getService()
 	if not service then
+		Log.warn("PluginConnectionService недоступен — записи будут передаваться через резервное сохранение")
 		return
 	end
 	local testType
-	local ok = pcall(function()
+	local ok, err = pcall(function()
 		testType = Enum.PluginConnectionTargetType.Test
 		if not service:CanHaveConnectionType(testType) then
-			error("no test connections")
+			error("CanHaveConnectionType(Test) = false")
 		end
 	end)
 	if not ok then
+		Log.warn("связь с тестами недоступна (" .. tostring(err) .. ") — используется резервное сохранение")
 		return
 	end
 	local function bind(conn)
@@ -93,9 +161,7 @@ function Bridge:listenFromTests(onRecording: (string) -> (), onChanged: () -> ()
 			return
 		end
 		local binding = conn:BindToMessage(function(msg)
-			if type(msg) == "string" and startsWith(msg, MSG_REC) then
-				onRecording(string.sub(msg, #MSG_REC + 1))
-			end
+			self:onMessage(msg, onRecording)
 		end)
 		self.tests[conn] = binding
 		conn:GetPropertyChangedSignal("Connected"):Connect(function()
@@ -134,7 +200,7 @@ end
 
 -- Playtest side --------------------------------------------------------------
 
-function Bridge:connectToEdit(onConfig: (any) -> ())
+function Bridge:connectToEdit(onConfig: (any) -> (), onConnected: () -> ())
 	local service = getService()
 	if not service then
 		return
@@ -163,23 +229,34 @@ function Bridge:connectToEdit(onConfig: (any) -> ())
 					end
 				end
 			end)
+			conn:SendMessage(MSG_HELLO)
+			onConnected()
 		end)
 		if not ok then
-			warn("[BBS Studio] нет связи с редактором: " .. tostring(err))
+			Log.warn("нет связи с редактором: " .. tostring(err))
 		end
 	end)
 end
 
-function Bridge:sendToEdit(str: string): boolean
+function Bridge:isConnectedToEdit(): boolean
+	local conn = self.editConnection
+	return conn ~= nil and conn.Connected
+end
+
+function Bridge:sendToEdit(id: string, str: string): (boolean, string?)
 	local conn = self.editConnection
 	if not conn then
-		return false
+		return false, "нет соединения"
 	end
-	local ok = pcall(function()
-		assert(conn.Connected, "disconnected")
-		conn:SendMessage(MSG_REC .. str)
+	local ok, err = pcall(function()
+		assert(conn.Connected, "соединение закрыто")
+		local count = math.max(1, math.ceil(#str / PART_SIZE))
+		for i = 1, count do
+			local data = string.sub(str, (i - 1) * PART_SIZE + 1, i * PART_SIZE)
+			conn:SendMessage(MSG_PART .. id .. "\n" .. i .. "\n" .. count .. "\n" .. data)
+		end
 	end)
-	return ok
+	return ok, if ok then nil else tostring(err)
 end
 
 return Bridge

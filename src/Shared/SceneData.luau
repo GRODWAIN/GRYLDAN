@@ -11,6 +11,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local Codec = require(script.Parent.Codec)
 local CameraTrack = require(script.Parent.CameraTrack)
+local Rig = require(script.Parent.Rig)
 
 local SceneData = {}
 
@@ -180,6 +181,8 @@ function SceneData.addSkin(actor: Instance, model: Model, name: string?): string
 		unique = base .. " " .. n
 	end
 	model.Name = unique
+	model.Archivable = true
+	Rig.sanitize(model)
 	model.Parent = folder
 	local default = actor:GetAttribute("DefaultSkin")
 	if not default or not SceneData.getSkin(actor, default) then
