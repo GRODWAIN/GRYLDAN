@@ -11,6 +11,16 @@ local Appearance = require(script.Parent.Appearance)
 local Recorder = {}
 Recorder.__index = Recorder
 
+-- Compact Humanoid state codes stored per frame (used to pick skin animations later).
+local STATE_CODES = {
+	[Enum.HumanoidStateType.Jumping] = 2,
+	[Enum.HumanoidStateType.Freefall] = 3,
+	[Enum.HumanoidStateType.FallingDown] = 3,
+	[Enum.HumanoidStateType.Climbing] = 4,
+	[Enum.HumanoidStateType.Seated] = 5,
+	[Enum.HumanoidStateType.Swimming] = 6,
+}
+
 function Recorder.new()
 	return setmetatable({ recording = false, elapsed = 0 }, Recorder)
 end
@@ -37,6 +47,15 @@ function Recorder:start(opts): (boolean, string?)
 	for i, name in parts do
 		motors[i] = jointMap[name]
 	end
+	local kinds = {}
+	for _, m in motors do
+		kinds[m.ClassName] = (kinds[m.ClassName] or 0) + 1
+	end
+	local kindText = {}
+	for className, count in kinds do
+		table.insert(kindText, className .. "×" .. count)
+	end
+	self.jointSummary = if #parts > 0 then table.concat(kindText, ", ") else "суставы не найдены"
 
 	local desc = nil
 	if humanoid then
@@ -70,11 +89,15 @@ function Recorder:start(opts): (boolean, string?)
 			lastRoot = root.CFrame
 			local joints = table.create(#motors)
 			for i, motor in motors do
-				joints[i] = if motor.Parent then motor.Transform else lastJoints[i]
+				joints[i] = if motor.Parent then (motor :: any).Transform else lastJoints[i]
 			end
 			lastJoints = joints
 		end
-		table.insert(frames, { root = lastRoot, joints = lastJoints })
+		local s = 1
+		if humanoid and humanoid.Parent then
+			s = STATE_CODES[humanoid:GetState()] or 1
+		end
+		table.insert(frames, { root = lastRoot, joints = lastJoints, s = s })
 	end
 	sample()
 	nextSample = interval

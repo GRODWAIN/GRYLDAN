@@ -1,34 +1,7 @@
-local fs = require("@lune/fs")
-local luau = require("@lune/luau")
-local serde = require("@lune/serde")
-local roblox = require("@lune/roblox")
-local CFrame, Vector3, Instance = roblox.CFrame, roblox.Vector3, roblox.Instance
-
-local ROOT = "src/"
-local HttpService = {
-	JSONEncode = function(_, v) return serde.encode("json", v) end,
-	JSONDecode = function(_, s) return serde.decode("json", s) end,
-	GenerateGUID = function() return "12345678-aaaa-bbbb-cccc-dddddddddddd" end,
-	UrlEncode = function(_, s) return s end, UrlDecode = function(_, s) return s end,
-}
-local moved = 0
-local Workspace = { BulkMoveTo = function(_, parts, cfs) for i, p in parts do p.CFrame = cfs[i] end moved += 1 end }
-local services = { HttpService = HttpService, Workspace = Workspace, ReplicatedStorage = Instance.new("Folder") }
-local game = { GetService = function(_, n) return services[n] or error("no service " .. n) end, PlaceId = 0 }
-
-local function proxy(name) return setmetatable({ __module = name }, { __index = function(_, k) return proxy(k) end }) end
-local cache = {}
-local function load(name)
-	if cache[name] then return cache[name] end
-	local path = fs.isFile(ROOT .. "Shared/" .. name .. ".luau") and ROOT .. "Shared/" .. name .. ".luau" or ROOT .. "Plugin/" .. name .. ".luau"
-	local env = setmetatable({ game = game, script = proxy(name), CFrame = CFrame, Vector3 = Vector3, Instance = Instance,
-		Color3 = roblox.Color3, Enum = roblox.Enum, print = function() end, warn = function() end,
-		require = function(m) return load(m.__module) end }, { __index = _G })
-	cache[name] = luau.load(luau.compile(fs.readFile(path)), { debugName = name, environment = env })()
-	return cache[name]
-end
+local H = require("./harness")
+local CFrame, Vector3, Instance = H.CFrame, H.Vector3, H.Instance
+local check, load = H.check, H.load
 local function near(a, b, eps) return (a - b).Magnitude <= (eps or 1e-3) end
-local function check(cond, msg) if not cond then error("FAIL: " .. msg, 2) end print("ok  " .. msg) end
 
 local Rig, Codec = load("Rig"), load("Codec")
 
@@ -62,8 +35,8 @@ check(neck.Enabled == false and w.Enabled == false, "joints disabled")
 local parts = { "LowerTorso", "UpperTorso" } -- recorded joint order (Part1 names)
 local rootCf = CFrame.new(10, 3, 5) * CFrame.Angles(0, math.rad(90), 0)
 local waistT = CFrame.Angles(math.rad(30), 0, 0)
-Rig.apply(info, parts, rootCf, { CFrame.identity, waistT })
-check(moved == 1, "BulkMoveTo used once per apply")
+Rig.applyPose(info, rootCf, { LowerTorso = CFrame.identity, UpperTorso = waistT })
+check(H.stats.bulkMoves == 1, "BulkMoveTo used once per apply")
 check(near(hrp.CFrame.Position, rootCf.Position), "root placed")
 local expLower = rootCf * CFrame.new(0, -0.2, 0)
 check(near(lower.CFrame.Position, expLower.Position), "lower torso via Root motor")

@@ -2,36 +2,14 @@
 -- Camera keyframes: { t, cf, fov, ease }. The ease of a key controls the segment that starts at it.
 local HttpService = game:GetService("HttpService")
 local Codec = require(script.Parent.Codec)
+local Ease = require(script.Parent.Ease)
 
 local CameraTrack = {}
 
-CameraTrack.EASES = { "linear", "smooth", "in", "out", "cut" }
-CameraTrack.EASE_LABELS = {
-	linear = "Ровно",
-	smooth = "Плавно",
-	["in"] = "Разгон",
-	out = "Торможение",
-	cut = "Склейка",
-}
-
-local EASE = {
-	linear = function(a)
-		return a
-	end,
-	smooth = function(a)
-		return a * a * (3 - 2 * a)
-	end,
-	["in"] = function(a)
-		return a * a
-	end,
-	out = function(a)
-		return 1 - (1 - a) * (1 - a)
-	end,
-	-- hold this shot until the next key, then jump: a hard cut between shots
-	cut = function(_a)
-		return 0
-	end,
-}
+CameraTrack.EASES = Ease.LIST
+-- for the camera, "cut" holds the shot and then jumps: a hard cut between shots
+CameraTrack.EASE_LABELS = table.clone(Ease.LABELS)
+CameraTrack.EASE_LABELS.cut = "Склейка"
 
 function CameraTrack.new()
 	return { interp = "catmull", keys = {} }
@@ -60,7 +38,7 @@ function CameraTrack.decode(str: string?)
 			t = tonumber(k.t) or 0,
 			cf = Codec.arrayToCFrame(k.p or {}, 1),
 			fov = tonumber(k.fov) or 70,
-			ease = if EASE[k.ease] then k.ease else "linear",
+			ease = if Ease.valid(k.ease) then k.ease else "linear",
 		})
 	end
 	CameraTrack.sort(track)
@@ -105,7 +83,7 @@ function CameraTrack.evaluate(track, t: number): (CFrame?, number?)
 	local k1, k2 = keys[i], keys[i + 1]
 	local span = k2.t - k1.t
 	local a = if span > 0 then math.clamp((t - k1.t) / span, 0, 1) else 1
-	a = (EASE[k1.ease] or EASE.linear)(a)
+	a = Ease.apply(k1.ease, a)
 
 	local pos
 	if track.interp == "catmull" then

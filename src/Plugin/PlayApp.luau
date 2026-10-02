@@ -11,11 +11,13 @@ local Codec = require(Shared.Codec)
 local SceneData = require(Shared.SceneData)
 local Playback = require(Shared.Playback)
 local Log = require(Shared.Log)
+local ClipLibrary = require(Shared.ClipLibrary)
 
 local UI = require(script.Parent.UI)
 local Bridge = require(script.Parent.Bridge)
 local Recorder = require(script.Parent.Recorder)
 local Version = require(script.Parent.Version)
+local ClipLoader = require(script.Parent.ClipLoader)
 
 local C = UI.C
 local SETTING_FPS = "BBS_RecordFPS"
@@ -113,6 +115,7 @@ end
 
 function PlayApp.start(plugin: Plugin)
 	local player = Players.LocalPlayer
+	ClipLibrary.setLoader(ClipLoader)
 	local bridge = Bridge.new(plugin)
 	local recorder = Recorder.new()
 	local playback = Playback.new({ folderName = "BBS_LocalPuppets" })
@@ -272,11 +275,11 @@ function PlayApp.start(plugin: Plugin)
 		end
 		Log.info(
 			string.format(
-				"дубль «%s»: %.1f с, %d кадров, %d суставов, %d КБ · редактор: %s · резерв: %s",
+				"дубль «%s»: %.1f с, %d кадров, суставы: %s, %d КБ · редактор: %s · резерв: %s",
 				rec.name,
 				rec.length,
 				#rec.frames,
-				#rec.parts,
+				tostring(recorder.jointSummary),
 				math.ceil(#str / 1024),
 				if sent then "отправлен" else "нет (" .. tostring(sendErr) .. ")",
 				if saved then "сохранён" else "ошибка (" .. tostring(saveErr) .. ")"

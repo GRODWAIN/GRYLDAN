@@ -36,6 +36,654 @@ end
       </Properties>
       <Item class="ModuleScript" referent="2">
         <Properties>
+          <string name="Name">AnimTab</string>
+          <string name="Source"><![CDATA[--!nonstrict
+-- "Анимация" tab: base motion mode, skin animation sets, timed action clips and pose keyframes.
+local Shared = script.Parent.Parent.Shared
+local SceneData = require(Shared.SceneData)
+local PoseTrack = require(Shared.PoseTrack)
+local Anims = require(Shared.Anims)
+local ClipLibrary = require(Shared.ClipLibrary)
+local Motion = require(Shared.Motion)
+local Ease = require(Shared.Ease)
+local Rig = require(Shared.Rig)
+local Log = require(Shared.Log)
+
+local UI = require(script.Parent.UI)
+local BodyParts = require(script.Parent.BodyParts)
+local Appearance = require(script.Parent.Appearance)
+
+local C = UI.C
+local ROT_STEP = 5
+local POS_STEP = 0.1
+
+local AnimTab = {}
+
+local MODE_OPTIONS = {
+	{ value = "auto", label = "Режим: авто" },
+	{ value = "record", label = "Режим: записанные движения" },
+	{ value = "skin", label = "Режим: анимации скина" },
+	{ value = "none", label = "Режим: только позы" },
+}
+local MODE_TEXT = {
+	record = "сейчас играют записанные движения суставов",
+	skin = "сейчас играют анимации скина (стоит / шаг / бег / прыжок…) по траектории записи",
+	none = "базового движения нет, только ваши позы",
+}
+
+local function rel(app, actor: Instance): number
+	return app.playback.time - (tonumber(actor:GetAttribute("Offset")) or 0)
+end
+AnimTab.rel = rel
+
+local function statusMark(id: string?): (string, Color3)
+	local st = ClipLibrary.getStatus(id)
+	if st == "ok" then
+		return "✓", C.good
+	elseif st == "loading" then
+		return "…", C.warn
+	elseif st == "error" then
+		return "×", C.danger
+	end
+	return "·", C.dim
+end
+
+-- Skin shown in the editors: the user's pick, else the skin at the cursor, else the default.
+function AnimTab.currentSkin(app, actor: Instance): Model?
+	local name = app.animSkin and app.animSkin[actor]
+	local skin = name and SceneData.getSkin(actor, name)
+	if skin then
+		return skin
+	end
+	local at = SceneData.skinAt(actor, rel(app, actor))
+	skin = at and SceneData.getSkin(actor, at)
+	if skin then
+		return skin
+	end
+	return SceneData.listSkins(actor)[1]
+end
+
+-- Pose ---------------------------------------------------------------------------
+
+function AnimTab.currentOffset(app, actor: Instance, name: string): CFrame
+	local live = app.playback.live[actor.Name]
+	if live and live[name] then
+		return live[name]
+	end
+	local keys = PoseTrack.get(actor)[name]
+	return if keys then PoseTrack.sample(keys, rel(app, actor)) else CFrame.identity
+end
+
+function AnimTab.setKey(app, actor: Instance, name: string, cf: CFrame, ease: string?)
+	local tracks = PoseTrack.copy(PoseTrack.get(actor))
+	local t = math.max(0, rel(app, actor))
+	local keys = tracks[name] or {}
+	local i = PoseTrack.keyAt(keys, t)
+	if i then
+		keys[i].cf = cf
+		keys[i].e = ease or keys[i].e
+	else
+		table.insert(keys, { t = t, cf = cf, e = ease or "smooth" })
+	end
+	tracks[name] = keys
+	app:mutate("ключ позы", function()
+		PoseTrack.set(actor, tracks)
+	end)
+end
+
+function AnimTab.editTracks(app, actor: Instance, label: string, fn: (any) -> ())
+	local tracks = PoseTrack.copy(PoseTrack.get(actor))
+	fn(tracks)
+	app:mutate(label, function()
+		PoseTrack.set(actor, tracks)
+	end)
+end
+
+local function decompose(cf: CFrame): { number }
+	local rx, ry, rz = cf:ToEulerAnglesXYZ()
+	local p = cf.Position
+	return { p.X, p.Y, p.Z, math.deg(rx), math.deg(ry), math.deg(rz) }
+end
+
+local function compose(v: { number }): CFrame
+	return CFrame.new(v[1], v[2], v[3])
+		* CFrame.fromEulerAnglesXYZ(math.rad(v[4]), math.rad(v[5]), math.rad(v[6]))
+end
+
+function AnimTab.partNames(app, actor: Instance): { [string]: boolean }
+	local set = { [BodyParts.ROOT] = true }
+	local skin = AnimTab.currentSkin(app, actor)
+	if skin then
+		for name in Rig.getJoints(skin) do
+			set[name] = true
+		end
+	end
+	local rec = SceneData.getRecording(actor)
+	if rec then
+		for _, name in rec.parts do
+			set[name] = true
+		end
+	end
+	for name in PoseTrack.get(actor) do
+		set[name] = true
+	end
+	return set
+end
+
+local function renderPose(app, actor: Instance)
+	local sec = UI.section("Позы — ключевые кадры частей тела", app.content)
+	UI.paragraph(
+		"Выберите часть тела, поставьте курсор на таймлайне и поверните её (стрелки в окне просмотра или поля ниже). Ключ ставится сам. Между ключами поза меняется плавно, а поверх идёт движение актёра.",
+		{ Parent = sec }
+	)
+	local tracks = PoseTrack.get(actor)
+	local names = AnimTab.partNames(app, actor)
+	if not names[app.selectedPart] then
+		app.selectedPart = if names.Head then "Head" else BodyParts.ROOT
+	end
+	for _, row in BodyParts.rows(names) do
+		local r = UI.new("Frame", {
+			BackgroundTransparency = 1,
+			Size = UDim2.new(1, 0, 0, 24),
+			Parent = sec,
+		})
+		UI.new("UIListLayout", {
+			FillDirection = Enum.FillDirection.Horizontal,
+			HorizontalFlex = Enum.UIFlexAlignment.Fill,
+			Padding = UDim.new(0, 4),
+			SortOrder = Enum.SortOrder.LayoutOrder,
+			Parent = r,
+		})
+		for _, name in row do
+			local keyed = tracks[name] ~= nil
+			local label = BodyParts.label(name) .. (if keyed then "  ◆" else "")
+			UI.button(label, function()
+				app.selectedPart = name
+				app:render()
+			end, {
+				Parent = r,
+				AutomaticSize = Enum.AutomaticSize.None,
+				Size = UDim2.new(0, 60, 0, 24),
+				BackgroundColor3 = if name == app.selectedPart then C.accent else C.panel2,
+				TextColor3 = if keyed and name ~= app.selectedPart then C.warn else C.text,
+			})
+		end
+	end
+
+	local name = app.selectedPart
+	local keys = tracks[name] or {}
+	local t = rel(app, actor)
+	local keyIndex = PoseTrack.keyAt(keys, t)
+	local values = decompose(AnimTab.currentOffset(app, actor, name))
+
+	local edit = UI.section(nil, app.content)
+	UI.label(BodyParts.label(name) .. "  ·  " .. UI.formatTime(math.max(0, t)) .. " от начала актёра", {
+		Parent = edit,
+		Font = UI.FONT_BOLD,
+	})
+	UI.row({
+		UI.cycle({
+			{ value = "rotate", label = "Стрелки: поворот" },
+			{ value = "move", label = "Стрелки: сдвиг" },
+			{ value = "off", label = "Стрелки: выкл" },
+		}, app.gizmoMode, function(v)
+			app.gizmoMode = v
+			app.gizmo:update()
+		end),
+		UI.toggle("Шаг 15°", app.gizmoSnap, function(v)
+			app.gizmoSnap = v
+		end),
+	}, { Parent = edit })
+
+	local fields = {
+		{ 4, "Поворот X", ROT_STEP },
+		{ 5, "Поворот Y", ROT_STEP },
+		{ 6, "Поворот Z", ROT_STEP },
+		{ 1, "Сдвиг X", POS_STEP },
+		{ 2, "Сдвиг Y", POS_STEP },
+		{ 3, "Сдвиг Z", POS_STEP },
+	}
+	for _, f in fields do
+		local index, label, step = f[1], f[2], f[3]
+		local function setValue(v: number)
+			local copy = table.clone(values)
+			copy[index] = v
+			AnimTab.setKey(app, actor, name, compose(copy))
+		end
+		local row = UI.row({}, { Parent = edit })
+		UI.label(label, { Parent = row, Size = UDim2.fromOffset(78, 24), TextColor3 = C.dim })
+		UI.button("−", function()
+			setValue(values[index] - step)
+		end, { Parent = row, AutomaticSize = Enum.AutomaticSize.None, Size = UDim2.fromOffset(26, 24) })
+		UI.textbox(UI.formatNumber(values[index]), function(text, box)
+			local v = UI.parseNumber(text)
+			if v then
+				setValue(v)
+			else
+				box.Text = UI.formatNumber(values[index])
+			end
+		end, { Parent = row, Size = UDim2.fromOffset(64, 24) })
+		UI.button("+", function()
+			setValue(values[index] + step)
+		end, { Parent = row, AutomaticSize = Enum.AutomaticSize.None, Size = UDim2.fromOffset(26, 24) })
+		UI.label(if index >= 4 then "°" else "студ.", { Parent = row, Size = UDim2.fromOffset(30, 24), TextColor3 = C.dim })
+	end
+
+	local keyRow = UI.row({}, { Parent = edit })
+	UI.button("◀", function()
+		local target
+		for _, k in keys do
+			if k.t < t - 0.02 then
+				target = k.t
+			end
+		end
+		if target then
+			app:pausePlayback()
+			app:seek(target + (tonumber(actor:GetAttribute("Offset")) or 0))
+			app:render()
+		end
+	end, { Parent = keyRow })
+	UI.button("◆ Ключ", function()
+		AnimTab.setKey(app, actor, name, AnimTab.currentOffset(app, actor, name))
+	end, { Parent = keyRow, BackgroundColor3 = C.accent })
+	UI.button("▶", function()
+		for _, k in keys do
+			if k.t > t + 0.02 then
+				app:pausePlayback()
+				app:seek(k.t + (tonumber(actor:GetAttribute("Offset")) or 0))
+				app:render()
+				return
+			end
+		end
+	end, { Parent = keyRow })
+	UI.button("Обнулить", function()
+		AnimTab.setKey(app, actor, name, CFrame.identity)
+	end, { Parent = keyRow })
+	if keyIndex then
+		local easeOptions = {}
+		for _, e in Ease.LIST do
+			table.insert(easeOptions, { value = e, label = "Переход: " .. Ease.LABELS[e] })
+		end
+		local keyRow2 = UI.row({}, { Parent = edit })
+		UI.label("Ключ на курсоре", { Parent = keyRow2, Size = UDim2.fromOffset(96, 24), TextColor3 = C.warn })
+		UI.cycle(easeOptions, keys[keyIndex].e, function(v)
+			AnimTab.editTracks(app, actor, "переход ключа", function(tr)
+				tr[name][keyIndex].e = v
+			end)
+		end, { Parent = keyRow2 })
+		UI.button("Удалить ключ", function()
+			AnimTab.editTracks(app, actor, "удаление ключа позы", function(tr)
+				table.remove(tr[name], keyIndex)
+				if #tr[name] == 0 then
+					tr[name] = nil
+				end
+			end)
+		end, { Parent = keyRow2, BackgroundColor3 = C.danger })
+	end
+	UI.label(string.format("Ключей у части: %d", #keys), { Parent = edit, TextSize = 12, TextColor3 = C.dim })
+
+	local poseRow = UI.row({}, { Parent = edit })
+	UI.button("Копировать позу", function()
+		local clip = {}
+		for part in AnimTab.partNames(app, actor) do
+			if tracks[part] then
+				clip[part] = AnimTab.currentOffset(app, actor, part)
+			end
+		end
+		app.poseClipboard = clip
+		app:toast("Поза скопирована", C.good)
+	end, { Parent = poseRow })
+	UI.button("Вставить", function()
+		local clip = app.poseClipboard
+		if not clip then
+			app:toast("Сначала скопируйте позу", C.warn)
+			return
+		end
+		local at = math.max(0, rel(app, actor))
+		AnimTab.editTracks(app, actor, "вставка позы", function(tr)
+			for part, cf in clip do
+				local list = tr[part] or {}
+				local i = PoseTrack.keyAt(list, at)
+				if i then
+					list[i].cf = cf
+				else
+					table.insert(list, { t = at, cf = cf, e = "smooth" })
+				end
+				tr[part] = list
+			end
+		end)
+	end, { Parent = poseRow })
+	UI.button("Очистить часть", function()
+		AnimTab.editTracks(app, actor, "очистка части", function(tr)
+			tr[name] = nil
+		end)
+	end, { Parent = poseRow, BackgroundColor3 = C.danger })
+	UI.button("Очистить все позы", function()
+		AnimTab.editTracks(app, actor, "очистка поз", function(tr)
+			table.clear(tr)
+		end)
+	end, { Parent = poseRow, BackgroundColor3 = C.danger })
+end
+
+-- Motion and skin animations -------------------------------------------------------
+
+local function writeSkinAnims(app, skin: Model, set)
+	app.playback:invalidate()
+	app:mutate("анимации скина", function()
+		Anims.write(skin, set)
+	end)
+end
+
+local function renderMotion(app, actor: Instance)
+	local rec = SceneData.getRecording(actor)
+	local sec = UI.section("Движение актёра", app.content)
+	UI.cycle(MODE_OPTIONS, Motion.getMode(actor), function(v)
+		app:mutate("режим движения", function()
+			actor:SetAttribute("Motion", if v == "auto" then nil else v)
+		end)
+	end, { Parent = sec })
+	local effective = Motion.effectiveMode(actor, rec)
+	UI.paragraph("→ " .. (MODE_TEXT[effective] or effective), { Parent = sec, TextColor3 = C.text })
+	if effective == "record" and rec and #rec.parts == 0 then
+		UI.paragraph("В этой записи нет суставов — выберите «анимации скина».", { Parent = sec, TextColor3 = C.warn })
+	end
+
+	local skins = SceneData.listSkins(actor)
+	local skin = AnimTab.currentSkin(app, actor)
+	local anims = UI.section("Анимации скина", app.content)
+	if not skin then
+		UI.paragraph("У актёра нет скина. Добавьте его во вкладке «Актёры».", { Parent = anims, TextColor3 = C.warn })
+		return
+	end
+	if #skins > 1 then
+		local options = {}
+		for _, s in skins do
+			table.insert(options, { value = s.Name, label = "Скин: " .. s.Name })
+		end
+		UI.cycle(options, skin.Name, function(v)
+			app.animSkin = app.animSkin or setmetatable({}, { __mode = "k" })
+			app.animSkin[actor] = v
+			app:render()
+		end, { Parent = anims })
+	else
+		UI.label("Скин: " .. skin.Name, { Parent = anims, TextColor3 = C.dim })
+	end
+	local rig = Anims.rigType(skin)
+	if not skin:FindFirstChildOfClass("Humanoid") or not rig then
+		UI.paragraph("Это не персонаж (нет Humanoid/R15/R6) — анимации скина к нему не применяются.", {
+			Parent = anims,
+			TextColor3 = C.warn,
+		})
+		return
+	end
+	local custom = Anims.read(skin)
+	local defaults = Anims.DEFAULTS[rig]
+	for _, state in Anims.STATES do
+		if defaults[state] or custom[state] then
+			local id = Anims.resolve(skin, state)
+			local mark, color = statusMark(id)
+			local row = UI.row({}, { Parent = anims })
+			UI.label(Anims.LABELS[state], { Parent = row, Size = UDim2.fromOffset(70, 24), TextColor3 = C.dim })
+			UI.flex(UI.textbox(custom[state] or "", function(text)
+				local value = ClipLibrary.normalize(text)
+				if (value or "") == (custom[state] or "") then
+					return
+				end
+				local set = table.clone(custom)
+				set[state] = value
+				writeSkinAnims(app, skin, set)
+				if value then
+					ClipLibrary.request(value, true)
+				end
+			end, {
+				Parent = row,
+				Size = UDim2.fromOffset(80, 24),
+				PlaceholderText = "стандарт: " .. tostring(defaults[state] or "—"),
+			}))
+			UI.label(mark, { Parent = row, Size = UDim2.fromOffset(16, 24), TextColor3 = color })
+			if ClipLibrary.getStatus(id) == "error" then
+				UI.button("↻", function()
+					ClipLibrary.request(id, true)
+					app:render()
+				end, { Parent = row })
+			end
+		end
+	end
+	UI.row({
+		UI.button("Стандартные Roblox", function()
+			writeSkinAnims(app, skin, nil)
+		end),
+	}, { Parent = anims })
+	local userRow = UI.row({}, { Parent = anims })
+	local userBox = UI.textbox("", nil, {
+		Parent = userRow,
+		PlaceholderText = "ник или UserId",
+		Size = UDim2.fromOffset(100, 24),
+	})
+	UI.flex(userBox)
+	UI.button("Взять анимации аватара", function()
+		AnimTab.animsFromUser(app, skin, userBox.Text)
+	end, { Parent = userRow })
+	UI.paragraph(
+		"Пустое поле — стандартная анимация. Вставьте ID анимации (rbxassetid://…), чтобы заменить. Анимации скачиваются один раз и сохраняются в плейсе, чтобы работать и в игре.",
+		{ Parent = anims }
+	)
+end
+
+function AnimTab.animsFromUser(app, skin: Model, text: string)
+	app:toast("Загрузка анимаций аватара…")
+	task.spawn(function()
+		local userId, name = Appearance.resolveUser(text)
+		if not userId then
+			app:toast("Игрок не найден: " .. text, C.warn)
+			return
+		end
+		local ok, model = pcall(Appearance.rigFromUserId, userId, Anims.rigType(skin) or "R15")
+		local set = ok and model and Anims.extractFromAnimate(model)
+		if model and typeof(model) == "Instance" then
+			model:Destroy()
+		end
+		if not set then
+			app:toast("Не удалось получить анимации аватара", C.warn)
+			return
+		end
+		writeSkinAnims(app, skin, set)
+		Log.info("анимации аватара " .. tostring(name) .. " назначены скину «" .. skin.Name .. "»")
+	end)
+end
+
+-- Actions -------------------------------------------------------------------------
+
+function AnimTab.editActions(app, actor: Instance, label: string, fn: (any) -> ())
+	local list = Motion.copyActions(actor)
+	fn(list)
+	app:mutate(label, function()
+		Motion.setActions(actor, list)
+	end)
+end
+
+local function addAction(app, actor: Instance, id: string?, name: string)
+	id = ClipLibrary.normalize(id)
+	if not id then
+		app:toast("Неверный ID анимации", C.warn)
+		return
+	end
+	ClipLibrary.request(id, true)
+	local at = math.max(0, rel(app, actor))
+	AnimTab.editActions(app, actor, "действие", function(list)
+		table.insert(list, { t = at, id = id, name = name, speed = 1, loop = false, fade = 0.2 })
+	end)
+end
+
+local function renderActions(app, actor: Instance)
+	local sec = UI.section("Действия — анимации в нужный момент", app.content)
+	UI.paragraph(
+		"Поставьте курсор и добавьте анимацию: на время её действия она заменит движение (плавно входит и выходит). Позы применяются поверх.",
+		{ Parent = sec }
+	)
+	local skin = AnimTab.currentSkin(app, actor)
+	local rig = Anims.rigType(skin) or "R15"
+	local presetRow = UI.new("Frame", {
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		Parent = sec,
+	})
+	UI.new("UIGridLayout", {
+		CellSize = UDim2.new(0.25, -4, 0, 24),
+		CellPadding = UDim2.fromOffset(4, 4),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		Parent = presetRow,
+	})
+	for _, preset in Anims.EMOTES[rig] do
+		UI.button(preset.label, function()
+			addAction(app, actor, preset.id, preset.label)
+		end, { Parent = presetRow, AutomaticSize = Enum.AutomaticSize.None })
+	end
+	local customRow = UI.row({}, { Parent = sec })
+	local idBox = UI.textbox("", nil, {
+		Parent = customRow,
+		PlaceholderText = "ID своей анимации",
+		Size = UDim2.fromOffset(100, 24),
+	})
+	UI.flex(idBox)
+	UI.button("+ на курсоре", function()
+		addAction(app, actor, idBox.Text, "ID " .. idBox.Text)
+	end, { Parent = customRow, BackgroundColor3 = C.accent })
+
+	local offset = tonumber(actor:GetAttribute("Offset")) or 0
+	for i, a in Motion.getActions(actor) do
+		local mark, color = statusMark(a.id)
+		local row = UI.row({}, { Parent = sec })
+		UI.label(mark, { Parent = row, Size = UDim2.fromOffset(14, 24), TextColor3 = color })
+		UI.flex(UI.label(a.name, { Parent = row, Size = UDim2.fromOffset(60, 24) }))
+		UI.textbox(UI.formatNumber(offset + a.t), function(text, box)
+			local v = UI.parseNumber(text)
+			if not v then
+				box.Text = UI.formatNumber(offset + a.t)
+				return
+			end
+			AnimTab.editActions(app, actor, "время действия", function(list)
+				list[i].t = math.max(0, v - offset)
+			end)
+		end, { Parent = row, Size = UDim2.fromOffset(44, 24) })
+		UI.textbox("×" .. UI.formatNumber(a.speed), function(text, box)
+			local v = UI.parseNumber((string.gsub(text, "[x×]", "")))
+			if not v then
+				box.Text = "×" .. UI.formatNumber(a.speed)
+				return
+			end
+			AnimTab.editActions(app, actor, "скорость действия", function(list)
+				list[i].speed = math.clamp(v, 0.05, 10)
+			end)
+		end, { Parent = row, Size = UDim2.fromOffset(40, 24) })
+		UI.toggle("Петля", a.loop, function(v)
+			AnimTab.editActions(app, actor, "петля действия", function(list)
+				list[i].loop = v
+				if v and not list[i].dur then
+					list[i].dur = 3
+				end
+			end)
+		end, { Parent = row })
+		if a.loop then
+			UI.textbox(UI.formatNumber(a.dur or 3), function(text, box)
+				local v = UI.parseNumber(text)
+				if not v then
+					box.Text = UI.formatNumber(a.dur or 3)
+					return
+				end
+				AnimTab.editActions(app, actor, "длительность действия", function(list)
+					list[i].dur = math.max(0.1, v)
+				end)
+			end, { Parent = row, Size = UDim2.fromOffset(36, 24) })
+		end
+		UI.button("×", function()
+			AnimTab.editActions(app, actor, "удаление действия", function(list)
+				table.remove(list, i)
+			end)
+		end, { Parent = row, BackgroundColor3 = C.danger })
+	end
+end
+
+-- Entry -----------------------------------------------------------------------------
+
+function AnimTab.render(app)
+	local root = SceneData.getRoot(false)
+	local actors = if root then SceneData.listActors(root) else {}
+	local actor = app.selected
+	if not actor or not actor.Parent then
+		local sec = UI.section("Анимация", app.content)
+		if #actors == 0 then
+			UI.paragraph("Сначала запишите актёра или добавьте его во вкладке «Актёры».", { Parent = sec })
+			return
+		end
+		UI.paragraph("Выберите актёра:", { Parent = sec })
+		for _, a in actors do
+			UI.button(SceneData.getName(a), function()
+				app.selected = a
+				app:render()
+			end, { Parent = sec })
+		end
+		return
+	end
+	local head = UI.section(nil, app.content)
+	local options = {}
+	for _, a in actors do
+		table.insert(options, { value = a, label = "Актёр: " .. SceneData.getName(a) })
+	end
+	UI.row({
+		UI.cycle(options, actor, function(v)
+			app.selected = v
+			app:render()
+		end),
+		UI.button("◎", function()
+			app:focusActor(actor)
+		end),
+	}, { Parent = head })
+	renderMotion(app, actor)
+	renderPose(app, actor)
+	renderActions(app, actor)
+end
+
+-- Requests every clip the scene can use, so the in-game player has them baked.
+function AnimTab.prefetch(): number
+	local root = SceneData.getRoot(false)
+	if not root then
+		return 0
+	end
+	local ids = {}
+	for _, actor in SceneData.listActors(root) do
+		local rec = SceneData.getRecording(actor)
+		if Motion.effectiveMode(actor, rec) == "skin" then
+			for _, skin in SceneData.listSkins(actor) do
+				if Anims.rigType(skin) then
+					for _, state in Anims.STATES do
+						local id = Anims.resolve(skin, state)
+						if id then
+							ids[id] = true
+						end
+					end
+				end
+			end
+		end
+		for _, a in Motion.getActions(actor) do
+			ids[a.id] = true
+		end
+	end
+	local count = 0
+	for id in ids do
+		count += 1
+		ClipLibrary.request(id, false)
+	end
+	return count
+end
+
+return AnimTab
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="3">
+        <Properties>
           <string name="Name">App</string>
           <string name="Source"><![CDATA[--!nonstrict
 -- Edit-mode window: transport, timeline, actors, skins, camera, recordings and the in-game player.
@@ -53,6 +701,7 @@ local Rig = require(Shared.Rig)
 local SceneData = require(Shared.SceneData)
 local Playback = require(Shared.Playback)
 local Log = require(Shared.Log)
+local ClipLibrary = require(Shared.ClipLibrary)
 
 local UI = require(script.Parent.UI)
 local Timeline = require(script.Parent.Timeline)
@@ -60,6 +709,9 @@ local History = require(script.Parent.History)
 local Appearance = require(script.Parent.Appearance)
 local Bridge = require(script.Parent.Bridge)
 local Version = require(script.Parent.Version)
+local AnimTab = require(script.Parent.AnimTab)
+local Gizmo = require(script.Parent.Gizmo)
+local ClipLoader = require(script.Parent.ClipLoader)
 
 local C = UI.C
 local GAP = 6
@@ -82,6 +734,7 @@ local AUTO_IMPORT_MAX_AGE = 6 * 3600
 
 local TABS = {
 	{ id = "actors", label = "Актёры" },
+	{ id = "anim", label = "Анимация" },
 	{ id = "camera", label = "Камера" },
 	{ id = "record", label = "Запись" },
 	{ id = "scene", label = "Сцена" },
@@ -127,6 +780,11 @@ function App.start(plugin: Plugin)
 	self.bridge = Bridge.new(plugin)
 	self.showPath = false
 	self.pathKey = nil
+	self.selectedPart = "Head"
+	self.gizmoMode = "rotate"
+	self.gizmoSnap = false
+	self.poseClipboard = nil
+	self.animSkin = setmetatable({}, { __mode = "k" })
 
 	-- Camera children are local to this Studio window: previews are not replicated to Team Create
 	-- collaborators and are never saved.
@@ -146,6 +804,31 @@ function App.start(plugin: Plugin)
 		Log.error(text)
 	end
 
+	ClipLibrary.setLoader(ClipLoader)
+	ClipLibrary.setWriter(function(fn)
+		return History.record("BBS: загрузка анимации", fn)
+	end)
+	local clipRefreshQueued = false
+	ClipLibrary.onChanged(function()
+		-- coalesce bursts of finished downloads into one refresh
+		if clipRefreshQueued or not self.alive then
+			return
+		end
+		clipRefreshQueued = true
+		task.defer(function()
+			clipRefreshQueued = false
+			if not self.alive then
+				return
+			end
+			if not self.playback.playing then
+				self.playback:evaluate(self.playback.time)
+			end
+			if self.tab == "anim" then
+				self:render()
+			end
+		end)
+	end)
+
 	local toolbar = plugin:CreateToolbar("BBS Studio")
 	self.button = toolbar:CreateButton("BBSStudioOpen", "BBS Studio — съёмка машинимы", "", "BBS Studio")
 	self.button.ClickableWhenViewportHidden = true
@@ -163,6 +846,7 @@ function App.start(plugin: Plugin)
 	self.button:SetActive(self.widget.Enabled)
 
 	self:buildShell()
+	self.gizmo = Gizmo.new(self)
 
 	local function track(conn)
 		table.insert(self.connections, conn)
@@ -213,6 +897,9 @@ function App.start(plugin: Plugin)
 		self.alive = false
 		self.playback:destroy()
 		self:clearPath()
+		if self.gizmo then
+			self.gizmo:destroy()
+		end
 		for _, conn in self.connections do
 			conn:Disconnect()
 		end
@@ -435,6 +1122,9 @@ end
 function App:onTime(t: number)
 	self.timeLabel.Text = UI.formatTime(t) .. " / " .. UI.formatTime(self.playback:length())
 	self.timeline:updatePlayhead(t)
+	if self.gizmo then
+		self.gizmo:update()
+	end
 end
 
 function App:updateTransport()
@@ -504,6 +1194,8 @@ function App:render()
 	UI.clear(self.content)
 	if self.tab == "actors" then
 		self:renderActors()
+	elseif self.tab == "anim" then
+		AnimTab.render(self)
 	elseif self.tab == "camera" then
 		self:renderCamera()
 	elseif self.tab == "record" then
@@ -754,6 +1446,11 @@ function App:renderActorDetails(actor: Instance)
 	}, { Parent = sec })
 
 	-- skins
+	local motionRow = UI.row({}, { Parent = sec })
+	UI.flex(UI.label("Анимация, позы и действия", { Parent = motionRow, Size = UDim2.fromOffset(80, 24), TextColor3 = C.dim }))
+	UI.button("Открыть вкладку «Анимация» →", function()
+		self:setTab("anim")
+	end, { Parent = motionRow, BackgroundColor3 = C.accent })
 	UI.label("Скины (морфы)", { Parent = sec, Font = UI.FONT_BOLD })
 	local default = actor:GetAttribute("DefaultSkin")
 	local skins = SceneData.listSkins(actor)
@@ -1506,6 +2203,10 @@ function App:renderDiagnostics()
 		"Активных тестов: " .. (if self.bridge:hasActiveTests() then "есть" else "нет"),
 		string.format("Актёров: %d · видимых марионеток сейчас: %d", #actors, puppets),
 		"Ожидают импорта: " .. (#self.bridge:getPendingIndex() + #self.importQueue),
+		(function()
+			local loaded, failed = ClipLibrary.counts()
+			return string.format("Анимаций в плейсе: %d · не загрузились: %d", loaded, failed)
+		end)(),
 	}
 	for _, line in lines do
 		UI.label(line, { Parent = sec, TextSize = 13, TextColor3 = C.dim })
@@ -1526,6 +2227,10 @@ function App:renderDiagnostics()
 end
 
 function App:installRuntime()
+	local clips = AnimTab.prefetch()
+	if clips > 0 then
+		Log.info("анимаций для игры: " .. clips .. " (недостающие докачиваются и сохраняются в BBS_Data.Clips)")
+	end
 	local ok = History.record("BBS: установка проигрывателя", function()
 		SceneData.getRoot(true)
 		local old = ReplicatedStorage:FindFirstChild(RUNTIME_FOLDER)
@@ -1557,7 +2262,7 @@ return App
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="3">
+      <Item class="ModuleScript" referent="4">
         <Properties>
           <string name="Name">Appearance</string>
           <string name="Source"><![CDATA[--!nonstrict
@@ -1754,7 +2459,108 @@ return Appearance
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="4">
+      <Item class="ModuleScript" referent="5">
+        <Properties>
+          <string name="Name">BodyParts</string>
+          <string name="Source"><![CDATA[--!nonstrict
+-- Human-readable names and layout of body parts (joint Part1 names) for R15 and R6.
+local BodyParts = {}
+
+BodyParts.ROOT = "__root"
+
+local LABELS = {
+	__root = "Всё тело",
+	Head = "Голова",
+	UpperTorso = "Грудь",
+	LowerTorso = "Таз",
+	Torso = "Торс",
+	LeftUpperArm = "Л. плечо",
+	RightUpperArm = "П. плечо",
+	LeftLowerArm = "Л. предплечье",
+	RightLowerArm = "П. предплечье",
+	LeftHand = "Л. кисть",
+	RightHand = "П. кисть",
+	LeftUpperLeg = "Л. бедро",
+	RightUpperLeg = "П. бедро",
+	LeftLowerLeg = "Л. голень",
+	RightLowerLeg = "П. голень",
+	LeftFoot = "Л. стопа",
+	RightFoot = "П. стопа",
+	["Left Arm"] = "Л. рука",
+	["Right Arm"] = "П. рука",
+	["Left Leg"] = "Л. нога",
+	["Right Leg"] = "П. нога",
+}
+
+local ROWS = {
+	{ "__root" },
+	{ "Head" },
+	{ "UpperTorso" },
+	{ "Torso" },
+	{ "LowerTorso" },
+	{ "LeftUpperArm", "RightUpperArm" },
+	{ "LeftLowerArm", "RightLowerArm" },
+	{ "LeftHand", "RightHand" },
+	{ "Left Arm", "Right Arm" },
+	{ "LeftUpperLeg", "RightUpperLeg" },
+	{ "LeftLowerLeg", "RightLowerLeg" },
+	{ "LeftFoot", "RightFoot" },
+	{ "Left Leg", "Right Leg" },
+}
+
+local ORDER = {}
+for i, row in ROWS do
+	for j, name in row do
+		ORDER[name] = i * 10 + j
+	end
+end
+
+function BodyParts.label(name: string): string
+	return LABELS[name] or name
+end
+
+function BodyParts.compare(a: string, b: string): boolean
+	local oa, ob = ORDER[a] or 1000, ORDER[b] or 1000
+	if oa == ob then
+		return a < b
+	end
+	return oa < ob
+end
+
+-- Rows of part names present in `available` (set), known parts first, then any others.
+function BodyParts.rows(available: { [string]: boolean }): { { string } }
+	local out = {}
+	local used = {}
+	for _, row in ROWS do
+		local present = {}
+		for _, name in row do
+			if available[name] then
+				table.insert(present, name)
+				used[name] = true
+			end
+		end
+		if #present > 0 then
+			table.insert(out, present)
+		end
+	end
+	local extra = {}
+	for name in available do
+		if not used[name] then
+			table.insert(extra, name)
+		end
+	end
+	table.sort(extra)
+	for i = 1, #extra, 2 do
+		table.insert(out, { extra[i], extra[i + 1] })
+	end
+	return out
+end
+
+return BodyParts
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="6">
         <Properties>
           <string name="Name">Bridge</string>
           <string name="Source"><![CDATA[--!nonstrict
@@ -2022,7 +2828,188 @@ return Bridge
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="5">
+      <Item class="ModuleScript" referent="7">
+        <Properties>
+          <string name="Name">ClipLoader</string>
+          <string name="Source"><![CDATA[--!nonstrict
+-- Downloads an animation asset and bakes it into Clip data (plugin-only API).
+local KeyframeSequenceProvider = game:GetService("KeyframeSequenceProvider")
+
+local Clip = require(script.Parent.Parent.Shared.Clip)
+
+return function(id: string): string
+	local kfs = (KeyframeSequenceProvider :: any):GetKeyframeSequenceAsync("rbxassetid://" .. id)
+	if not kfs or not kfs:IsA("KeyframeSequence") then
+		error("формат не поддерживается (" .. (if kfs then kfs.ClassName else "nil") .. ")", 0)
+	end
+	local clip = Clip.fromKeyframeSequence(kfs)
+	kfs:Destroy()
+	if next(clip.tracks) == nil then
+		error("в анимации нет поз", 0)
+	end
+	return Clip.encode(clip)
+end
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="8">
+        <Properties>
+          <string name="Name">Gizmo</string>
+          <string name="Source"><![CDATA[--!nonstrict
+-- Viewport arrows for posing: ArcHandles rotate and Handles move the selected body part.
+-- Drags preview through Playback.live and become a pose key on release.
+local CoreGui = game:GetService("CoreGui")
+
+local Shared = script.Parent.Parent.Shared
+local PoseTrack = require(Shared.PoseTrack)
+local UI = require(script.Parent.UI)
+local AnimTab = require(script.Parent.AnimTab)
+
+local Gizmo = {}
+Gizmo.__index = Gizmo
+
+-- Converts a direction in the part's space into the joint frame the pose offset lives in.
+local function toJointSpace(node, v: Vector3): Vector3
+	if node and node.c1 and not node.invert then
+		return node.c1:Inverse():VectorToWorldSpace(v)
+	end
+	return v
+end
+
+function Gizmo.new(app)
+	local self = setmetatable({ app = app, dragging = nil }, Gizmo)
+	local folder = Instance.new("Folder")
+	folder.Name = "BBS_Gizmo"
+	folder.Archivable = false
+	pcall(function()
+		folder.Parent = CoreGui
+	end)
+	self.folder = folder
+
+	local arc = Instance.new("ArcHandles")
+	arc.Name = "Rotate"
+	arc.Visible = false
+	arc.Parent = folder
+	self.arc = arc
+
+	local move = Instance.new("Handles")
+	move.Name = "Move"
+	move.Style = Enum.HandlesStyle.Movement
+	move.Color3 = UI.C.warn
+	move.Visible = false
+	move.Parent = folder
+	self.move = move
+
+	arc.MouseButton1Down:Connect(function()
+		self:begin()
+	end)
+	move.MouseButton1Down:Connect(function()
+		self:begin()
+	end)
+	arc.MouseDrag:Connect(function(axis, angle)
+		local d = self.dragging
+		if not d then
+			return
+		end
+		if app.gizmoSnap then
+			angle = math.rad(math.floor(math.deg(angle) / 15 + 0.5) * 15)
+		end
+		local axisVector = toJointSpace(d.node, Vector3.FromAxis(axis))
+		self:preview(CFrame.fromAxisAngle(axisVector, angle))
+	end)
+	move.MouseDrag:Connect(function(face, distance)
+		local d = self.dragging
+		if not d then
+			return
+		end
+		local dir = toJointSpace(d.node, Vector3.FromNormalId(face))
+		self:preview(CFrame.new(dir * distance))
+	end)
+	arc.MouseButton1Up:Connect(function()
+		self:finish()
+	end)
+	move.MouseButton1Up:Connect(function()
+		self:finish()
+	end)
+	return self
+end
+
+function Gizmo:target()
+	local app = self.app
+	if app.tab ~= "anim" or app.gizmoMode == "off" then
+		return nil
+	end
+	local actor = app.selected
+	if not actor or not actor.Parent then
+		return nil
+	end
+	local name = app.selectedPart or PoseTrack.ROOT
+	local part, node = app.playback:getPuppetPart(actor, name)
+	if not part then
+		return nil
+	end
+	return actor, name, part, node
+end
+
+function Gizmo:update()
+	if self.dragging then
+		return
+	end
+	local _, _, part = self:target()
+	local mode = self.app.gizmoMode
+	self.arc.Adornee = if part and mode == "rotate" then part else nil
+	self.arc.Visible = part ~= nil and mode == "rotate"
+	self.move.Adornee = if part and mode == "move" then part else nil
+	self.move.Visible = part ~= nil and mode == "move"
+end
+
+function Gizmo:begin()
+	local actor, name, _, node = self:target()
+	if not actor then
+		return
+	end
+	self.app:pausePlayback()
+	self.dragging = {
+		actor = actor,
+		name = name,
+		node = node,
+		start = AnimTab.currentOffset(self.app, actor, name),
+	}
+end
+
+function Gizmo:preview(delta: CFrame)
+	local d = self.dragging
+	local playback = self.app.playback
+	playback.live[d.actor.Name] = { [d.name] = d.start * delta }
+	playback:evaluate(playback.time)
+end
+
+function Gizmo:finish()
+	local d = self.dragging
+	self.dragging = nil
+	if not d then
+		return
+	end
+	local playback = self.app.playback
+	local live = playback.live[d.actor.Name]
+	local value = live and live[d.name]
+	playback.live[d.actor.Name] = nil
+	if value then
+		AnimTab.setKey(self.app, d.actor, d.name, value)
+	else
+		self:update()
+	end
+end
+
+function Gizmo:destroy()
+	self.folder:Destroy()
+end
+
+return Gizmo
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="9">
         <Properties>
           <string name="Name">History</string>
           <string name="Source"><![CDATA[--!nonstrict
@@ -2053,7 +3040,7 @@ return History
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="6">
+      <Item class="ModuleScript" referent="10">
         <Properties>
           <string name="Name">PlayApp</string>
           <string name="Source"><![CDATA[--!nonstrict
@@ -2069,11 +3056,13 @@ local Codec = require(Shared.Codec)
 local SceneData = require(Shared.SceneData)
 local Playback = require(Shared.Playback)
 local Log = require(Shared.Log)
+local ClipLibrary = require(Shared.ClipLibrary)
 
 local UI = require(script.Parent.UI)
 local Bridge = require(script.Parent.Bridge)
 local Recorder = require(script.Parent.Recorder)
 local Version = require(script.Parent.Version)
+local ClipLoader = require(script.Parent.ClipLoader)
 
 local C = UI.C
 local SETTING_FPS = "BBS_RecordFPS"
@@ -2171,6 +3160,7 @@ end
 
 function PlayApp.start(plugin: Plugin)
 	local player = Players.LocalPlayer
+	ClipLibrary.setLoader(ClipLoader)
 	local bridge = Bridge.new(plugin)
 	local recorder = Recorder.new()
 	local playback = Playback.new({ folderName = "BBS_LocalPuppets" })
@@ -2330,11 +3320,11 @@ function PlayApp.start(plugin: Plugin)
 		end
 		Log.info(
 			string.format(
-				"дубль «%s»: %.1f с, %d кадров, %d суставов, %d КБ · редактор: %s · резерв: %s",
+				"дубль «%s»: %.1f с, %d кадров, суставы: %s, %d КБ · редактор: %s · резерв: %s",
 				rec.name,
 				rec.length,
 				#rec.frames,
-				#rec.parts,
+				tostring(recorder.jointSummary),
 				math.ceil(#str / 1024),
 				if sent then "отправлен" else "нет (" .. tostring(sendErr) .. ")",
 				if saved then "сохранён" else "ошибка (" .. tostring(saveErr) .. ")"
@@ -2616,7 +3606,7 @@ return PlayApp
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="7">
+      <Item class="ModuleScript" referent="11">
         <Properties>
           <string name="Name">Recorder</string>
           <string name="Source"><![CDATA[--!nonstrict
@@ -2631,6 +3621,16 @@ local Appearance = require(script.Parent.Appearance)
 
 local Recorder = {}
 Recorder.__index = Recorder
+
+-- Compact Humanoid state codes stored per frame (used to pick skin animations later).
+local STATE_CODES = {
+	[Enum.HumanoidStateType.Jumping] = 2,
+	[Enum.HumanoidStateType.Freefall] = 3,
+	[Enum.HumanoidStateType.FallingDown] = 3,
+	[Enum.HumanoidStateType.Climbing] = 4,
+	[Enum.HumanoidStateType.Seated] = 5,
+	[Enum.HumanoidStateType.Swimming] = 6,
+}
 
 function Recorder.new()
 	return setmetatable({ recording = false, elapsed = 0 }, Recorder)
@@ -2658,6 +3658,15 @@ function Recorder:start(opts): (boolean, string?)
 	for i, name in parts do
 		motors[i] = jointMap[name]
 	end
+	local kinds = {}
+	for _, m in motors do
+		kinds[m.ClassName] = (kinds[m.ClassName] or 0) + 1
+	end
+	local kindText = {}
+	for className, count in kinds do
+		table.insert(kindText, className .. "×" .. count)
+	end
+	self.jointSummary = if #parts > 0 then table.concat(kindText, ", ") else "суставы не найдены"
 
 	local desc = nil
 	if humanoid then
@@ -2691,11 +3700,15 @@ function Recorder:start(opts): (boolean, string?)
 			lastRoot = root.CFrame
 			local joints = table.create(#motors)
 			for i, motor in motors do
-				joints[i] = if motor.Parent then motor.Transform else lastJoints[i]
+				joints[i] = if motor.Parent then (motor :: any).Transform else lastJoints[i]
 			end
 			lastJoints = joints
 		end
-		table.insert(frames, { root = lastRoot, joints = lastJoints })
+		local s = 1
+		if humanoid and humanoid.Parent then
+			s = STATE_CODES[humanoid:GetState()] or 1
+		end
+		table.insert(frames, { root = lastRoot, joints = lastJoints, s = s })
 	end
 	sample()
 	nextSample = interval
@@ -2729,7 +3742,7 @@ return Recorder
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="8">
+      <Item class="ModuleScript" referent="12">
         <Properties>
           <string name="Name">Timeline</string>
           <string name="Source"><![CDATA[--!nonstrict
@@ -2737,13 +3750,16 @@ return Recorder
 local UI = require(script.Parent.UI)
 local Shared = script.Parent.Parent.Shared
 local SceneData = require(Shared.SceneData)
+local PoseTrack = require(Shared.PoseTrack)
+local Motion = require(Shared.Motion)
+local BodyParts = require(script.Parent.BodyParts)
 
 local C = UI.C
 local LABEL_W = 92
 local RULER_H = 18
 local ROW_H = 22
 local RIGHT_PAD = 10
-local MAX_VISIBLE_ROWS = 6
+local MAX_VISIBLE_ROWS = 8
 
 local Timeline = {}
 Timeline.__index = Timeline
@@ -2824,7 +3840,12 @@ function Timeline:beginScrub()
 	local viewLen = self.viewLen
 	app:beginDrag(function(mouse: Vector2)
 		app:seek(math.min(self:timeAtX(mouse.X, viewLen), app.playback:length()))
-	end, function() end)
+	end, function()
+		-- pose fields show values at the cursor, refresh them once the scrub ends
+		if app.tab == "anim" then
+			app:render()
+		end
+	end)
 end
 
 function Timeline:beginClipDrag(actor: Instance)
@@ -2857,6 +3878,113 @@ function Timeline:beginClipDrag(actor: Instance)
 			actor:SetAttribute("Offset", final)
 		end)
 	end)
+end
+
+-- Drag a pose key diamond to retime it; a click selects the part and jumps to the key.
+function Timeline:beginKeyDrag(actor: Instance, partName: string, index: number, diamond: GuiObject)
+	local app = self.app
+	local viewLen = self.viewLen
+	local offset = tonumber(actor:GetAttribute("Offset")) or 0
+	local keys = PoseTrack.get(actor)[partName]
+	local key = keys and keys[index]
+	if not key then
+		return
+	end
+	local startT = key.t
+	local startX = app.widget:GetRelativeMousePosition().X
+	local moved = false
+	local newT = startT
+	app:pausePlayback()
+	app:beginDrag(function(mouse: Vector2)
+		local dx = mouse.X - startX
+		if math.abs(dx) < 3 and not moved then
+			return
+		end
+		moved = true
+		local width = math.max(1, self.ruler.AbsoluteSize.X)
+		newT = math.max(0, startT + dx / width * viewLen)
+		newT = math.floor(newT * 30 + 0.5) / 30
+		diamond.Position = UDim2.new((offset + newT) / viewLen, 0, 0.5, 0)
+	end, function()
+		app.selectedPart = partName
+		app.selected = actor
+		app.tab = "anim"
+		if not moved then
+			app:seek(offset + startT)
+			app:render()
+			return
+		end
+		local tracks = PoseTrack.copy(PoseTrack.get(actor))
+		local list = tracks[partName]
+		if list and list[index] then
+			list[index].t = newT
+		end
+		app:mutate("перенос ключа позы", function()
+			PoseTrack.set(actor, tracks)
+		end)
+		app:seek(offset + newT)
+	end)
+end
+
+-- Extra lanes under the selected actor: timed actions and one lane per posed body part.
+function Timeline:addActorSubrows(actor: Instance): number
+	local app = self.app
+	local viewLen = self.viewLen
+	local offset = tonumber(actor:GetAttribute("Offset")) or 0
+	local rows = 0
+	local actions = Motion.getActions(actor)
+	if #actions > 0 then
+		rows += 1
+		local lane = self:makeRow("  ↳ Действия", C.dim, function()
+			app:setTab("anim")
+		end)
+		for _, a in actions do
+			local bar = UI.new("Frame", {
+				BackgroundColor3 = C.good,
+				BackgroundTransparency = 0.3,
+				BorderSizePixel = 0,
+				Position = UDim2.new((offset + a.t) / viewLen, 0, 0, 4),
+				Size = UDim2.new(Motion.actionLength(a) / viewLen, 0, 1, -8),
+				ZIndex = 2,
+				Parent = lane,
+			})
+			UI.corner(bar, 3)
+			UI.new("UISizeConstraint", { MinSize = Vector2.new(4, 0), Parent = bar })
+		end
+	end
+	local tracks = PoseTrack.get(actor)
+	local names = {}
+	for name in tracks do
+		table.insert(names, name)
+	end
+	table.sort(names, BodyParts.compare)
+	for _, name in names do
+		rows += 1
+		local isSel = app.tab == "anim" and app.selectedPart == name
+		local lane = self:makeRow("  ↳ " .. BodyParts.label(name), if isSel then C.warn else C.dim, function()
+			app.selectedPart = name
+			app.selected = actor
+			app:setTab("anim")
+		end)
+		for i, key in tracks[name] do
+			local diamond = UI.new("TextButton", {
+				Text = "",
+				AutoButtonColor = false,
+				BackgroundColor3 = if isSel then Color3.new(1, 1, 1) else C.accent,
+				BorderSizePixel = 0,
+				AnchorPoint = Vector2.new(0.5, 0.5),
+				Position = UDim2.new((offset + key.t) / viewLen, 0, 0.5, 0),
+				Size = UDim2.fromOffset(9, 9),
+				Rotation = 45,
+				ZIndex = 3,
+				Parent = lane,
+			})
+			diamond.MouseButton1Down:Connect(function()
+				self:beginKeyDrag(actor, name, i, diamond)
+			end)
+		end
+	end
+	return rows
 end
 
 function Timeline:drawTicks()
@@ -2978,6 +4106,7 @@ function Timeline:rebuild()
 	end
 
 	local actors = if root then SceneData.listActors(root) else {}
+	local subrows = 0
 	for _, actor in actors do
 		local color = actor:GetAttribute("Color") or C.accent
 		local enabled = actor:GetAttribute("Enabled") ~= false
@@ -3028,9 +4157,12 @@ function Timeline:rebuild()
 		clip.MouseButton1Down:Connect(function()
 			self:beginClipDrag(actor)
 		end)
+		if actor == app.selected then
+			subrows += self:addActorSubrows(actor)
+		end
 	end
 
-	local rowCount = 1 + #actors
+	local rowCount = 1 + #actors + subrows
 	local height = RULER_H + 4 + math.min(rowCount, MAX_VISIBLE_ROWS) * (ROW_H + 2) + 4
 	if height ~= self.height then
 		self.height = height
@@ -3051,7 +4183,7 @@ return Timeline
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="9">
+      <Item class="ModuleScript" referent="13">
         <Properties>
           <string name="Name">UI</string>
           <string name="Source"><![CDATA[--!nonstrict
@@ -3352,13 +4484,13 @@ return UI
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="10">
+      <Item class="ModuleScript" referent="14">
         <Properties>
           <string name="Name">Version</string>
           <string name="Source"><![CDATA[--!nonstrict
 local Version = {}
 
-Version.NUMBER = "0.3.0"
+Version.NUMBER = "0.4.0"
 Version.LABEL = "BBS Studio v" .. Version.NUMBER
 
 return Version
@@ -3366,47 +4498,204 @@ return Version
         </Properties>
       </Item>
     </Item>
-    <Item class="Folder" referent="11">
+    <Item class="Folder" referent="15">
       <Properties>
         <string name="Name">Shared</string>
       </Properties>
-      <Item class="ModuleScript" referent="12">
+      <Item class="ModuleScript" referent="16">
+        <Properties>
+          <string name="Name">Anims</string>
+          <string name="Source"><![CDATA[--!nonstrict
+-- Animation sets of skins. Each skin may carry Configuration "BBS_Anims" (StringValue per state,
+-- value = animation asset id). It is filled from the skin's Animate script when the skin is added
+-- and can be edited in the plugin. Missing states fall back to Roblox's default animations.
+local Anims = {}
+
+Anims.FOLDER = "BBS_Anims"
+Anims.STATES = { "idle", "walk", "run", "jump", "fall", "climb", "sit", "swim", "swimidle" }
+Anims.LABELS = {
+	idle = "Стоит",
+	walk = "Шаг",
+	run = "Бег",
+	jump = "Прыжок",
+	fall = "Падение",
+	climb = "Лазание",
+	sit = "Сидит",
+	swim = "Плывёт",
+	swimidle = "На воде",
+}
+
+-- From Roblox's default Animate scripts.
+Anims.DEFAULTS = {
+	R15 = {
+		idle = "507766666",
+		walk = "507777826",
+		run = "507767714",
+		jump = "507765000",
+		fall = "507767968",
+		climb = "507765644",
+		sit = "507768133",
+		swim = "507784897",
+		swimidle = "507785072",
+	},
+	R6 = {
+		idle = "180435571",
+		walk = "180426354",
+		run = "180426354",
+		jump = "125750702",
+		fall = "180436148",
+		climb = "180436334",
+		sit = "178130996",
+	},
+}
+
+Anims.EMOTES = {
+	R15 = {
+		{ label = "Помахать", id = "507770239" },
+		{ label = "Указать", id = "507770453" },
+		{ label = "Танец 1", id = "507771019" },
+		{ label = "Танец 2", id = "507776043" },
+		{ label = "Танец 3", id = "507777268" },
+		{ label = "Смех", id = "507770818" },
+		{ label = "Радость", id = "507770677" },
+	},
+	R6 = {
+		{ label = "Помахать", id = "128777973" },
+		{ label = "Указать", id = "128853357" },
+		{ label = "Танец 1", id = "182435998" },
+		{ label = "Танец 2", id = "182436842" },
+		{ label = "Танец 3", id = "182436935" },
+		{ label = "Смех", id = "129423131" },
+		{ label = "Радость", id = "129423030" },
+	},
+}
+
+local FALLBACK = { run = "walk", swim = "walk", swimidle = "idle", climb = "walk", sit = "idle", fall = "jump" }
+
+function Anims.rigType(model: Instance?): string?
+	if not model then
+		return nil
+	end
+	if model:FindFirstChild("UpperTorso") then
+		return "R15"
+	end
+	if model:FindFirstChild("Torso") then
+		return "R6"
+	end
+	return nil
+end
+
+local function digits(id: any): string?
+	if type(id) ~= "string" then
+		return nil
+	end
+	local d = string.match(id, "(%d+)%s*$") or string.match(id, "id=(%d+)")
+	return if d and d ~= "0" then d else nil
+end
+
+-- Reads the state animations from a Roblox Animate script (StringValue per state with Animations).
+function Anims.extractFromAnimate(model: Instance): { [string]: string }?
+	local animate = model:FindFirstChild("Animate")
+	if not animate then
+		return nil
+	end
+	local set = {}
+	local found = false
+	for _, state in Anims.STATES do
+		local holder = animate:FindFirstChild(state)
+		if holder then
+			local best, bestWeight = nil, -1
+			for _, anim in holder:GetChildren() do
+				if anim:IsA("Animation") then
+					local w = anim:FindFirstChild("Weight")
+					local weight = if w and w:IsA("NumberValue") then w.Value else 1
+					local id = digits(anim.AnimationId)
+					if id and weight > bestWeight then
+						best, bestWeight = id, weight
+					end
+				end
+			end
+			if best then
+				set[state] = best
+				found = true
+			end
+		end
+	end
+	return if found then set else nil
+end
+
+function Anims.read(skin: Instance?): { [string]: string }
+	local set = {}
+	local folder = skin and skin:FindFirstChild(Anims.FOLDER)
+	if folder then
+		for _, sv in folder:GetChildren() do
+			if sv:IsA("StringValue") then
+				local id = digits(sv.Value)
+				if id then
+					set[sv.Name] = id
+				end
+			end
+		end
+	end
+	return set
+end
+
+-- Replaces the custom set (nil or empty clears it, falling back to defaults).
+function Anims.write(skin: Instance, set: { [string]: string }?)
+	local folder = skin:FindFirstChild(Anims.FOLDER)
+	if folder then
+		folder:Destroy()
+	end
+	if not set or next(set) == nil then
+		return
+	end
+	folder = Instance.new("Configuration")
+	folder.Name = Anims.FOLDER
+	for state, id in set do
+		local sv = Instance.new("StringValue")
+		sv.Name = state
+		sv.Value = id
+		sv.Parent = folder
+	end
+	folder.Parent = skin
+end
+
+function Anims.resolve(skin: Instance?, state: string): string?
+	local custom = Anims.read(skin)
+	local defaults = Anims.DEFAULTS[Anims.rigType(skin) or "R15"]
+	local s = state
+	for _ = 1, 4 do
+		local id = custom[s] or defaults[s]
+		if id then
+			return id
+		end
+		s = FALLBACK[s]
+		if not s then
+			break
+		end
+	end
+	return defaults.idle
+end
+
+return Anims
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="17">
         <Properties>
           <string name="Name">CameraTrack</string>
           <string name="Source"><![CDATA[--!nonstrict
 -- Camera keyframes: { t, cf, fov, ease }. The ease of a key controls the segment that starts at it.
 local HttpService = game:GetService("HttpService")
 local Codec = require(script.Parent.Codec)
+local Ease = require(script.Parent.Ease)
 
 local CameraTrack = {}
 
-CameraTrack.EASES = { "linear", "smooth", "in", "out", "cut" }
-CameraTrack.EASE_LABELS = {
-	linear = "Ровно",
-	smooth = "Плавно",
-	["in"] = "Разгон",
-	out = "Торможение",
-	cut = "Склейка",
-}
-
-local EASE = {
-	linear = function(a)
-		return a
-	end,
-	smooth = function(a)
-		return a * a * (3 - 2 * a)
-	end,
-	["in"] = function(a)
-		return a * a
-	end,
-	out = function(a)
-		return 1 - (1 - a) * (1 - a)
-	end,
-	-- hold this shot until the next key, then jump: a hard cut between shots
-	cut = function(_a)
-		return 0
-	end,
-}
+CameraTrack.EASES = Ease.LIST
+-- for the camera, "cut" holds the shot and then jumps: a hard cut between shots
+CameraTrack.EASE_LABELS = table.clone(Ease.LABELS)
+CameraTrack.EASE_LABELS.cut = "Склейка"
 
 function CameraTrack.new()
 	return { interp = "catmull", keys = {} }
@@ -3435,7 +4724,7 @@ function CameraTrack.decode(str: string?)
 			t = tonumber(k.t) or 0,
 			cf = Codec.arrayToCFrame(k.p or {}, 1),
 			fov = tonumber(k.fov) or 70,
-			ease = if EASE[k.ease] then k.ease else "linear",
+			ease = if Ease.valid(k.ease) then k.ease else "linear",
 		})
 	end
 	CameraTrack.sort(track)
@@ -3480,7 +4769,7 @@ function CameraTrack.evaluate(track, t: number): (CFrame?, number?)
 	local k1, k2 = keys[i], keys[i + 1]
 	local span = k2.t - k1.t
 	local a = if span > 0 then math.clamp((t - k1.t) / span, 0, 1) else 1
-	a = (EASE[k1.ease] or EASE.linear)(a)
+	a = Ease.apply(k1.ease, a)
 
 	local pos
 	if track.interp == "catmull" then
@@ -3501,7 +4790,359 @@ return CameraTrack
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="13">
+      <Item class="ModuleScript" referent="18">
+        <Properties>
+          <string name="Name">Clip</string>
+          <string name="Source"><![CDATA[--!nonstrict
+-- Animation clips baked from KeyframeSequences into plain data, so they can be sampled anywhere
+-- (edit mode, playtest, live game) without the Animator.
+-- Track per joint (Part1 name): times, Motor6D/AnimationConstraint transforms and easing per key.
+local HttpService = game:GetService("HttpService")
+local TweenService = game:GetService("TweenService")
+
+local Codec = require(script.Parent.Codec)
+
+local Clip = {}
+
+local STYLE_CODE = {
+	Linear = "L",
+	Constant = "C",
+	Cubic = "Cu",
+	CubicV2 = "Cu",
+	Elastic = "El",
+	Bounce = "Bo",
+}
+-- PoseEasingDirection In/Out are reversed relative to TweenService (documented legacy quirk)
+local DIR_CODE = { In = "O", Out = "I", InOut = "IO" }
+
+local TWEEN_STYLE = {
+	Cu = Enum.EasingStyle.Cubic,
+	El = Enum.EasingStyle.Elastic,
+	Bo = Enum.EasingStyle.Bounce,
+}
+local TWEEN_DIR = {
+	I = Enum.EasingDirection.In,
+	O = Enum.EasingDirection.Out,
+	IO = Enum.EasingDirection.InOut,
+}
+
+local function round(v: number): number
+	return math.floor(v * 10000 + 0.5) / 10000
+end
+
+function Clip.fromKeyframeSequence(kfs: KeyframeSequence)
+	local tracks = {}
+	local length = 0
+	local keyframes = {}
+	for _, kf in kfs:GetKeyframes() do
+		if kf:IsA("Keyframe") then
+			table.insert(keyframes, kf)
+		end
+	end
+	table.sort(keyframes, function(a, b)
+		return a.Time < b.Time
+	end)
+
+	local function addPose(pose: Pose, time: number)
+		-- weight 0 poses only keep the hierarchy and do not animate their part
+		if pose.Weight > 0 then
+			local track = tracks[pose.Name]
+			if not track then
+				track = { t = {}, p = {}, e = {} }
+				tracks[pose.Name] = track
+			end
+			local arr = Codec.cframeToArray(pose.CFrame)
+			for i, v in arr do
+				arr[i] = round(v)
+			end
+			table.insert(track.t, round(time))
+			table.insert(track.p, arr)
+			local style = STYLE_CODE[pose.EasingStyle.Name] or "L"
+			local dir = DIR_CODE[pose.EasingDirection.Name] or "I"
+			table.insert(track.e, style .. ":" .. dir)
+		end
+		for _, sub in pose:GetSubPoses() do
+			if sub:IsA("Pose") then
+				addPose(sub, time)
+			end
+		end
+	end
+
+	for _, kf in keyframes do
+		length = math.max(length, kf.Time)
+		for _, pose in kf:GetPoses() do
+			if pose:IsA("Pose") then
+				addPose(pose, kf.Time)
+			end
+		end
+	end
+	return { length = length, loop = kfs.Loop, tracks = tracks }
+end
+
+function Clip.encode(clip): string
+	return HttpService:JSONEncode({ v = 1, length = clip.length, loop = clip.loop, tracks = clip.tracks })
+end
+
+function Clip.decode(str: string)
+	local data = HttpService:JSONDecode(str)
+	if type(data) ~= "table" or type(data.tracks) ~= "table" then
+		return nil
+	end
+	local tracks = {}
+	for name, tr in data.tracks do
+		local cfs = table.create(#tr.p)
+		for i, arr in tr.p do
+			cfs[i] = Codec.arrayToCFrame(arr, 1)
+		end
+		local eases = table.create(#tr.e)
+		for i, code in tr.e do
+			local style, dir = string.match(code, "^(%a+):(%a+)$")
+			eases[i] = { style = style or "L", dir = TWEEN_DIR[dir or "I"] or Enum.EasingDirection.In }
+		end
+		if #cfs > 0 then
+			tracks[name] = { t = tr.t, cf = cfs, e = eases }
+		end
+	end
+	return { length = tonumber(data.length) or 0, loop = data.loop == true, tracks = tracks }
+end
+
+local function ease(e, a: number): number
+	local style = e and e.style or "L"
+	if style == "L" then
+		return a
+	elseif style == "C" then
+		return 0
+	end
+	local tweenStyle = TWEEN_STYLE[style]
+	if not tweenStyle then
+		return a
+	end
+	return TweenService:GetValue(a, tweenStyle, e.dir)
+end
+
+-- Writes joint transforms at time t into out[name]. loop overrides the clip's own Loop flag.
+function Clip.sample(clip, t: number, out: { [string]: CFrame }, loop: boolean?)
+	local len = clip.length
+	local doLoop = if loop == nil then clip.loop else loop
+	if len > 0 then
+		if doLoop then
+			t %= len
+		else
+			t = math.clamp(t, 0, len)
+		end
+	else
+		t = 0
+	end
+	for name, tr in clip.tracks do
+		local times, cfs = tr.t, tr.cf
+		local n = #times
+		if n == 1 or t <= times[1] then
+			out[name] = cfs[1]
+		elseif t >= times[n] then
+			out[name] = cfs[n]
+		else
+			local lo, hi = 1, n
+			while hi - lo > 1 do
+				local mid = (lo + hi) // 2
+				if times[mid] <= t then
+					lo = mid
+				else
+					hi = mid
+				end
+			end
+			local span = times[hi] - times[lo]
+			local a = if span > 0 then (t - times[lo]) / span else 1
+			out[name] = cfs[lo]:Lerp(cfs[hi], ease(tr.e[lo], a))
+		end
+	end
+end
+
+return Clip
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="19">
+        <Properties>
+          <string name="Name">ClipLibrary</string>
+          <string name="Source"><![CDATA[--!nonstrict
+-- Baked clips live in BBS_Data/Clips/<assetId> so they are saved with the place and work in game.
+-- The plugin installs a loader (KeyframeSequenceProvider); the live game only reads baked clips.
+local SceneData = require(script.Parent.SceneData)
+local Clip = require(script.Parent.Clip)
+local Log = require(script.Parent.Log)
+
+local ClipLibrary = {}
+
+ClipLibrary.loader = nil :: ((string) -> string)?
+ClipLibrary.writer = nil :: ((() -> ()) -> boolean)?
+
+local status: { [string]: string } = {}
+local errors: { [string]: string } = {}
+local listeners = {}
+local cache = setmetatable({}, { __mode = "k" })
+
+function ClipLibrary.normalize(id: any): string?
+	if type(id) == "number" then
+		return if id > 0 then tostring(math.floor(id)) else nil
+	end
+	if type(id) ~= "string" then
+		return nil
+	end
+	local digits = string.match(id, "(%d+)%s*$") or string.match(id, "id=(%d+)")
+	if not digits or digits == "0" then
+		return nil
+	end
+	return digits
+end
+
+function ClipLibrary.setLoader(fn)
+	ClipLibrary.loader = fn
+end
+
+function ClipLibrary.setWriter(fn)
+	ClipLibrary.writer = fn
+end
+
+function ClipLibrary.onChanged(fn: () -> ())
+	table.insert(listeners, fn)
+end
+
+local function fire()
+	for _, fn in listeners do
+		task.spawn(fn)
+	end
+end
+
+local function getFolder(create: boolean): Folder?
+	local root = SceneData.getRoot(create)
+	if not root then
+		return nil
+	end
+	local f = root:FindFirstChild("Clips")
+	if not f and create then
+		f = Instance.new("Folder")
+		f.Name = "Clips"
+		f.Parent = root
+	end
+	return f
+end
+
+local function findValue(id: string): StringValue?
+	local f = getFolder(false)
+	local sv = f and f:FindFirstChild(id)
+	return if sv and sv:IsA("StringValue") then sv else nil
+end
+
+local function decodeStored(id: string)
+	local sv = findValue(id)
+	if not sv then
+		return nil
+	end
+	local c = cache[sv]
+	if c and c.value == sv.Value then
+		return c.clip
+	end
+	local ok, clip = pcall(Clip.decode, sv.Value)
+	if ok and clip then
+		cache[sv] = { value = sv.Value, clip = clip }
+		return clip
+	end
+	return nil
+end
+
+-- Returns the baked clip, or nil while it is being downloaded (the caller shows the rest pose).
+function ClipLibrary.get(idText: any)
+	local id = ClipLibrary.normalize(idText)
+	if not id then
+		return nil
+	end
+	local clip = decodeStored(id)
+	if clip then
+		return clip
+	end
+	ClipLibrary.request(id, false)
+	return decodeStored(id)
+end
+
+function ClipLibrary.getStatus(idText: any): (string?, string?)
+	local id = ClipLibrary.normalize(idText)
+	if not id then
+		return nil, nil
+	end
+	if findValue(id) then
+		return "ok", nil
+	end
+	local st = status[id]
+	if st == "ok" then
+		return nil, nil
+	end
+	return st, errors[id]
+end
+
+function ClipLibrary.request(idText: any, force: boolean?)
+	local id = ClipLibrary.normalize(idText)
+	local loader = ClipLibrary.loader
+	if not id or not loader then
+		return
+	end
+	local st = status[id]
+	if st == "loading" or (st == "error" and not force) then
+		return
+	end
+	if not force and findValue(id) then
+		return
+	end
+	status[id] = "loading"
+	errors[id] = nil
+	task.spawn(function()
+		local ok, result = pcall(loader, id)
+		if ok and type(result) == "string" then
+			local function write()
+				local f = getFolder(true) :: Folder
+				local sv = f:FindFirstChild(id)
+				if not sv then
+					sv = Instance.new("StringValue")
+					sv.Name = id
+				end
+				sv.Value = result
+				sv.Parent = f
+			end
+			local written = if ClipLibrary.writer then ClipLibrary.writer(write) else (pcall(write))
+			if written then
+				status[id] = "ok"
+			else
+				status[id] = "error"
+				errors[id] = "не удалось сохранить"
+			end
+		else
+			status[id] = "error"
+			errors[id] = tostring(result)
+			Log.warn("анимация " .. id .. " не загрузилась: " .. tostring(result))
+		end
+		fire()
+	end)
+end
+
+function ClipLibrary.counts(): (number, number)
+	local loaded = 0
+	local f = getFolder(false)
+	if f then
+		loaded = #f:GetChildren()
+	end
+	local failed = 0
+	for _, st in status do
+		if st == "error" then
+			failed += 1
+		end
+	end
+	return loaded, failed
+end
+
+return ClipLibrary
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="20">
         <Properties>
           <string name="Name">Codec</string>
           <string name="Source"><![CDATA[--!nonstrict
@@ -3597,6 +5238,9 @@ function Codec.encodeRecording(rec): string
 		for j = 1, #rec.parts do
 			pushCFrame(nums, frame.joints[j] or CFrame.identity)
 		end
+		if frame.s then
+			table.insert(nums, tostring(frame.s))
+		end
 		out[i] = table.concat(nums, ",")
 	end
 	return "~" .. asciiEscape(HttpService:JSONEncode(header)) .. "\n" .. table.concat(out, ";")
@@ -3634,7 +5278,9 @@ function Codec.decodeRecording(str: string)
 				local base = 6 * j + 1
 				joints[j] = if base + 5 <= k then Codec.arrayToCFrame(nums, base) else CFrame.identity
 			end
-			table.insert(frames, { root = Codec.arrayToCFrame(nums, 1), joints = joints })
+			-- optional trailing number: recorded Humanoid state code (see Recorder)
+			local s = if k == 6 + 6 * #parts + 1 then nums[k] else nil
+			table.insert(frames, { root = Codec.arrayToCFrame(nums, 1), joints = joints, s = s })
 		end
 	end
 	local rec = {
@@ -3740,7 +5386,209 @@ return Codec
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="14">
+      <Item class="ModuleScript" referent="21">
+        <Properties>
+          <string name="Name">Ease</string>
+          <string name="Source"><![CDATA[--!nonstrict
+-- Easing shared by camera keys and pose keys. The ease of a key shapes the segment that starts at it.
+local Ease = {}
+
+Ease.LIST = { "linear", "smooth", "in", "out", "cut" }
+Ease.LABELS = {
+	linear = "Ровно",
+	smooth = "Плавно",
+	["in"] = "Разгон",
+	out = "Торможение",
+	cut = "Стоп-кадр",
+}
+
+local FN = {
+	linear = function(a)
+		return a
+	end,
+	smooth = function(a)
+		return a * a * (3 - 2 * a)
+	end,
+	["in"] = function(a)
+		return a * a
+	end,
+	out = function(a)
+		return 1 - (1 - a) * (1 - a)
+	end,
+	-- hold the value until the next key, then jump
+	cut = function(_a)
+		return 0
+	end,
+}
+
+function Ease.valid(name: any): boolean
+	return type(name) == "string" and FN[name] ~= nil
+end
+
+function Ease.apply(name: string?, a: number): number
+	return (FN[name or "linear"] or FN.linear)(a)
+end
+
+return Ease
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="22">
+        <Properties>
+          <string name="Name">Locomotion</string>
+          <string name="Source"><![CDATA[--!nonstrict
+-- Plays a skin's state animations (idle/walk/run/jump/...) along a recorded path, like Roblox's
+-- Animate script would: the state comes from the recorded Humanoid state or from root motion,
+-- and walk/run cycles advance with travelled distance so feet match the speed.
+local Clip = require(script.Parent.Clip)
+local ClipLibrary = require(script.Parent.ClipLibrary)
+local Anims = require(script.Parent.Anims)
+
+local Locomotion = {}
+
+local FADE = 0.2
+local MIN_SEGMENT = 0.15
+local STATE_FROM_CODE = { [2] = "jump", [3] = "fall", [4] = "climb", [5] = "sit", [6] = "swim" }
+local LOOPING = { idle = true, walk = true, run = true, climb = true, swim = true, swimidle = true, sit = true }
+
+local cache = setmetatable({}, { __mode = "k" })
+
+local function groundState(speed: number): string
+	if speed < 0.75 then
+		return "idle"
+	elseif speed < 12 then
+		return "walk"
+	end
+	return "run"
+end
+
+function Locomotion.analyze(rec)
+	local cached = cache[rec]
+	if cached and cached.frames == #rec.frames then
+		return cached
+	end
+	local frames = rec.frames
+	local n = #frames
+	local fps = rec.fps
+	local cum = table.create(n, 0)
+	for i = 2, n do
+		local d = frames[i].root.Position - frames[i - 1].root.Position
+		cum[i] = cum[i - 1] + Vector3.new(d.X, 0, d.Z).Magnitude
+	end
+	local states = table.create(n)
+	for i = 1, n do
+		local a, b = math.max(1, i - 3), math.min(n, i + 3)
+		local dt = math.max(b - a, 1) / fps
+		local speed = (cum[b] - cum[a]) / dt
+		local vy = (frames[b].root.Position.Y - frames[a].root.Position.Y) / dt
+		local code = frames[i].s
+		local st
+		if code and code > 0 then
+			st = STATE_FROM_CODE[code]
+			if st == "swim" and speed < 1 then
+				st = "swimidle"
+			end
+			st = st or groundState(speed)
+		elseif vy > 6 then
+			st = "jump"
+		elseif vy < -6 then
+			st = "fall"
+		else
+			st = groundState(speed)
+		end
+		states[i] = st
+	end
+	local raw = {}
+	for i = 1, n do
+		local last = raw[#raw]
+		if last and last.state == states[i] then
+			last.i1 = i
+		else
+			table.insert(raw, { state = states[i], i0 = i, i1 = i })
+		end
+	end
+	-- absorb flickers shorter than MIN_SEGMENT (jumps are short but real)
+	local segs = {}
+	for _, s in raw do
+		local last = segs[#segs]
+		local short = (s.i1 - s.i0 + 1) / fps < MIN_SEGMENT and s.state ~= "jump"
+		if last and (short or last.state == s.state) then
+			last.i1 = s.i1
+		else
+			table.insert(segs, s)
+		end
+	end
+	for _, s in segs do
+		s.t0 = (s.i0 - 1) / fps
+	end
+	local result = { frames = n, cum = cum, segs = segs }
+	cache[rec] = result
+	return result
+end
+
+local function cumAt(info, fps: number, t: number): number
+	local cum = info.cum
+	local f = math.max(0, t) * fps
+	local i = math.floor(f) + 1
+	local n = #cum
+	if i >= n then
+		return cum[n] or 0
+	end
+	return cum[i] + (cum[i + 1] - cum[i]) * (f - (i - 1))
+end
+
+local function sampleSegment(rec, info, seg, skin: Instance?, rig: string, t: number, out)
+	local clip = ClipLibrary.get(Anims.resolve(skin, seg.state))
+	if not clip then
+		return false
+	end
+	local animTime
+	if seg.state == "walk" or seg.state == "run" or seg.state == "swim" then
+		local divisor = if rig == "R6" then 14.5 elseif seg.state == "walk" then 8 else 16
+		animTime = (cumAt(info, rec.fps, t) - cumAt(info, rec.fps, seg.t0)) / divisor
+	else
+		animTime = t - seg.t0
+	end
+	Clip.sample(clip, animTime, out, if LOOPING[seg.state] then true else nil)
+	return true
+end
+
+function Locomotion.sample(rec, rel: number, skin: Instance?, out: { [string]: CFrame })
+	if #rec.frames == 0 then
+		return
+	end
+	local info = Locomotion.analyze(rec)
+	local segs = info.segs
+	local t = math.clamp(rel, 0, rec.length)
+	local lo, hi = 1, #segs
+	while lo < hi do
+		local mid = (lo + hi + 1) // 2
+		if segs[mid].t0 <= t then
+			lo = mid
+		else
+			hi = mid - 1
+		end
+	end
+	local seg = segs[lo]
+	local rig = Anims.rigType(skin) or "R15"
+	sampleSegment(rec, info, seg, skin, rig, t, out)
+	local into = t - seg.t0
+	if lo > 1 and into < FADE then
+		local prev = {}
+		if sampleSegment(rec, info, segs[lo - 1], skin, rig, t, prev) then
+			local w = into / FADE
+			for name, cf in prev do
+				out[name] = cf:Lerp(out[name] or CFrame.identity, w)
+			end
+		end
+	end
+end
+
+return Locomotion
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="23">
         <Properties>
           <string name="Name">Log</string>
           <string name="Source"><![CDATA[--!nonstrict
@@ -3786,7 +5634,172 @@ return Log
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="15">
+      <Item class="ModuleScript" referent="24">
+        <Properties>
+          <string name="Name">Motion</string>
+          <string name="Source"><![CDATA[--!nonstrict
+-- Final pose of an actor at a moment: base motion (recorded joints / skin animations / none),
+-- then timed action clips, then the user's pose keyframes on top.
+local HttpService = game:GetService("HttpService")
+
+local Codec = require(script.Parent.Codec)
+local Clip = require(script.Parent.Clip)
+local ClipLibrary = require(script.Parent.ClipLibrary)
+local Locomotion = require(script.Parent.Locomotion)
+local PoseTrack = require(script.Parent.PoseTrack)
+
+local Motion = {}
+
+Motion.MODES = { "auto", "record", "skin", "none" }
+
+local actionsCache = setmetatable({}, { __mode = "k" })
+
+function Motion.getMode(actor: Instance): string
+	local mode = actor:GetAttribute("Motion")
+	return if type(mode) == "string" and table.find(Motion.MODES, mode) then mode else "auto"
+end
+
+function Motion.effectiveMode(actor: Instance, rec): string
+	local mode = Motion.getMode(actor)
+	if mode == "auto" then
+		return if rec and #rec.parts > 0 then "record" else "skin"
+	end
+	return mode
+end
+
+-- Actions: [{ t, id, name, speed, loop, dur, fade }], t relative to the actor's start.
+function Motion.getActions(actor: Instance)
+	local sv = actor:FindFirstChild("Actions")
+	if not sv or not sv:IsA("StringValue") then
+		return {}
+	end
+	local cached = actionsCache[actor]
+	if cached and cached.value == sv.Value then
+		return cached.list
+	end
+	local list = {}
+	local ok, data = pcall(function()
+		return HttpService:JSONDecode(sv.Value)
+	end)
+	if ok and type(data) == "table" then
+		for _, a in data do
+			if type(a) == "table" and ClipLibrary.normalize(a.id) then
+				table.insert(list, {
+					t = tonumber(a.t) or 0,
+					id = ClipLibrary.normalize(a.id),
+					name = if type(a.name) == "string" then a.name else ("ID " .. tostring(a.id)),
+					speed = math.clamp(tonumber(a.speed) or 1, 0.05, 10),
+					loop = a.loop == true,
+					dur = tonumber(a.dur),
+					fade = math.clamp(tonumber(a.fade) or 0.2, 0, 2),
+				})
+			end
+		end
+	end
+	table.sort(list, function(a, b)
+		return a.t < b.t
+	end)
+	actionsCache[actor] = { value = sv.Value, list = list }
+	return list
+end
+
+function Motion.setActions(actor: Instance, list)
+	local sv = actor:FindFirstChild("Actions")
+	if not sv then
+		sv = Instance.new("StringValue")
+		sv.Name = "Actions"
+		sv.Parent = actor
+	end
+	sv.Value = HttpService:JSONEncode(list)
+end
+
+function Motion.copyActions(actor: Instance)
+	local out = {}
+	for i, a in Motion.getActions(actor) do
+		out[i] = table.clone(a)
+	end
+	return out
+end
+
+-- Duration of an action in seconds (falls back to 1 s until its clip is loaded).
+function Motion.actionLength(a): number
+	if a.loop and a.dur and a.dur > 0 then
+		return a.dur
+	end
+	local clip = ClipLibrary.get(a.id)
+	if clip and clip.length > 0 then
+		return clip.length / a.speed
+	end
+	return a.dur or 1
+end
+
+local function applyActions(actor: Instance, rel: number, pose: { [string]: CFrame })
+	for _, a in Motion.getActions(actor) do
+		if rel >= a.t then
+			local len = Motion.actionLength(a)
+			local into = rel - a.t
+			if into <= len then
+				local clip = ClipLibrary.get(a.id)
+				if clip then
+					local w = 1
+					if a.fade > 0 then
+						w = math.clamp(math.min(into, len - into) / a.fade, 0, 1)
+					end
+					local tmp = {}
+					Clip.sample(clip, into * a.speed, tmp, a.loop)
+					for name, cf in tmp do
+						pose[name] = (pose[name] or CFrame.identity):Lerp(cf, w)
+					end
+				end
+			end
+		end
+	end
+end
+
+-- Returns the root CFrame and joint transforms (by Part1 name) of an actor at rel seconds.
+function Motion.evaluate(actor: Instance, rec, skin: Instance?, rel: number, live: { [string]: CFrame }?)
+	local rootCf, joints = Codec.sample(rec, rel)
+	if not rootCf then
+		return nil, nil
+	end
+	local pose = {}
+	local mode = Motion.effectiveMode(actor, rec)
+	if mode == "record" and joints then
+		for i, name in rec.parts do
+			pose[name] = joints[i]
+		end
+	elseif mode == "skin" and skin and skin:FindFirstChildOfClass("Humanoid") then
+		Locomotion.sample(rec, rel, skin, pose)
+	end
+	applyActions(actor, rel, pose)
+	local tracks = PoseTrack.get(actor)
+	for name, keys in tracks do
+		local offset = (live and live[name]) or PoseTrack.sample(keys, rel)
+		if name == PoseTrack.ROOT then
+			rootCf *= offset
+		else
+			pose[name] = (pose[name] or CFrame.identity) * offset
+		end
+	end
+	if live then
+		for name, offset in live do
+			if not tracks[name] then
+				if name == PoseTrack.ROOT then
+					rootCf *= offset
+				else
+					pose[name] = (pose[name] or CFrame.identity) * offset
+				end
+			end
+		end
+	end
+	return rootCf, pose
+end
+
+return Motion
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="25">
         <Properties>
           <string name="Name">Playback</string>
           <string name="Source"><![CDATA[--!nonstrict
@@ -3797,6 +5810,8 @@ local Workspace = game:GetService("Workspace")
 
 local Codec = require(script.Parent.Codec)
 local CameraTrack = require(script.Parent.CameraTrack)
+local Motion = require(script.Parent.Motion)
+local PoseTrack = require(script.Parent.PoseTrack)
 local Rig = require(script.Parent.Rig)
 local SceneData = require(script.Parent.SceneData)
 
@@ -3813,6 +5828,8 @@ function Playback.new(opts)
 	end
 	self.puppets = {}
 	self.exclude = {}
+	-- temporary pose offsets while a gizmo is dragged: live[actorId][partName] = CFrame
+	self.live = {}
 	self.time = 0
 	self.playing = false
 	self.loop = false
@@ -3907,6 +5924,20 @@ function Playback:getPuppet(actor: Instance): Model?
 	return state and state.model
 end
 
+-- Puppet part driven by the joint named `name` (or the root for PoseTrack.ROOT) and its rig node.
+function Playback:getPuppetPart(actor: Instance, name: string): (BasePart?, any)
+	local state = self.puppets[actor]
+	local rig = state and state.rig
+	if not rig or not state.model or not state.model.Parent then
+		return nil, nil
+	end
+	if name == PoseTrack.ROOT then
+		return rig.root, nil
+	end
+	local node = rig.byName[name]
+	return node and node.part, node
+end
+
 function Playback:ensureSkin(actor: Instance, state, skinName: string?): Model?
 	if state.skin == skinName and state.model and state.model.Parent then
 		return state.model
@@ -3962,9 +5993,10 @@ function Playback:evaluateActor(actor: Instance, state, t: number)
 	if not rec then
 		return
 	end
-	local rootCf, joints = Codec.sample(rec, rel)
+	local source = SceneData.getSkin(actor, skin :: string)
+	local rootCf, pose = Motion.evaluate(actor, rec, source, rel, self.live[actor.Name])
 	if rootCf then
-		Rig.apply(state.rig, rec.parts, rootCf, joints)
+		Rig.applyPose(state.rig, rootCf, pose)
 	end
 end
 
@@ -4062,7 +6094,134 @@ return Playback
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="16">
+      <Item class="ModuleScript" referent="26">
+        <Properties>
+          <string name="Name">PoseTrack</string>
+          <string name="Source"><![CDATA[--!nonstrict
+-- User pose keyframes per body part, stored in actor StringValue "Pose".
+-- Each key is an offset applied on top of the base motion: joint transform = base * offset.
+-- Track "__root" offsets the whole body.
+local HttpService = game:GetService("HttpService")
+
+local Codec = require(script.Parent.Codec)
+local Ease = require(script.Parent.Ease)
+
+local PoseTrack = {}
+
+PoseTrack.ROOT = "__root"
+
+local cache = setmetatable({}, { __mode = "k" })
+
+function PoseTrack.get(actor: Instance): { [string]: { { t: number, cf: CFrame, e: string } } }
+	local sv = actor:FindFirstChild("Pose")
+	if not sv or not sv:IsA("StringValue") then
+		return {}
+	end
+	local cached = cache[actor]
+	if cached and cached.value == sv.Value then
+		return cached.tracks
+	end
+	local tracks = {}
+	local ok, data = pcall(function()
+		return HttpService:JSONDecode(sv.Value)
+	end)
+	if ok and type(data) == "table" then
+		for name, keys in data do
+			local list = {}
+			for _, k in keys do
+				table.insert(list, {
+					t = tonumber(k.t) or 0,
+					cf = Codec.arrayToCFrame(k.p or {}, 1),
+					e = if Ease.valid(k.e) then k.e else "smooth",
+				})
+			end
+			table.sort(list, function(a, b)
+				return a.t < b.t
+			end)
+			if #list > 0 then
+				tracks[name] = list
+			end
+		end
+	end
+	cache[actor] = { value = sv.Value, tracks = tracks }
+	return tracks
+end
+
+function PoseTrack.copy(tracks)
+	local out = {}
+	for name, keys in tracks do
+		local list = table.create(#keys)
+		for i, k in keys do
+			list[i] = table.clone(k)
+		end
+		out[name] = list
+	end
+	return out
+end
+
+function PoseTrack.set(actor: Instance, tracks)
+	local data = {}
+	for name, keys in tracks do
+		if #keys > 0 then
+			table.sort(keys, function(a, b)
+				return a.t < b.t
+			end)
+			local list = table.create(#keys)
+			for i, k in keys do
+				local p = Codec.cframeToArray(k.cf)
+				for j, v in p do
+					p[j] = math.floor(v * 10000 + 0.5) / 10000
+				end
+				list[i] = { t = math.floor(k.t * 1000 + 0.5) / 1000, p = p, e = k.e }
+			end
+			data[name] = list
+		end
+	end
+	local sv = actor:FindFirstChild("Pose")
+	if not sv then
+		sv = Instance.new("StringValue")
+		sv.Name = "Pose"
+		sv.Parent = actor
+	end
+	sv.Value = HttpService:JSONEncode(data)
+end
+
+function PoseTrack.sample(keys, t: number): CFrame
+	local n = #keys
+	if n == 0 then
+		return CFrame.identity
+	end
+	if n == 1 or t <= keys[1].t then
+		return keys[1].cf
+	end
+	if t >= keys[n].t then
+		return keys[n].cf
+	end
+	local i = 1
+	while i < n - 1 and keys[i + 1].t <= t do
+		i += 1
+	end
+	local k1, k2 = keys[i], keys[i + 1]
+	local span = k2.t - k1.t
+	local a = if span > 0 then (t - k1.t) / span else 1
+	return k1.cf:Lerp(k2.cf, Ease.apply(k1.e, a))
+end
+
+-- Index of the key within eps of t, if any.
+function PoseTrack.keyAt(keys, t: number, eps: number?): number?
+	for i, k in keys or {} do
+		if math.abs(k.t - t) <= (eps or 0.02) then
+			return i
+		end
+	end
+	return nil
+end
+
+return PoseTrack
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="27">
         <Properties>
           <string name="Name">Rig</string>
           <string name="Source"><![CDATA[--!nonstrict
@@ -4084,12 +6243,38 @@ local function insideAccessory(inst: Instance, model: Instance): boolean
 	return false
 end
 
+-- Animated joints: classic Motor6D, and AnimationConstraint which replaces it in R15 avatars
+-- since the Avatar Joint Upgrade. Both expose Transform with the same meaning.
+function Rig.isMotor(j: Instance): boolean
+	return j:IsA("Motor6D") or j:IsA("AnimationConstraint")
+end
+
+-- Part0, Part1, C0, C1 of an animated joint.
+function Rig.motorInfo(j: Instance): (BasePart?, BasePart?, CFrame?, CFrame?)
+	if j:IsA("Motor6D") then
+		return j.Part0, j.Part1, j.C0, j.C1
+	elseif j:IsA("AnimationConstraint") then
+		local a0, a1 = j.Attachment0, j.Attachment1
+		local p0 = a0 and a0.Parent
+		local p1 = a1 and a1.Parent
+		if p0 and p1 and p0:IsA("BasePart") and p1:IsA("BasePart") then
+			return p0, p1, a0.CFrame, a1.CFrame
+		end
+	end
+	return nil, nil, nil, nil
+end
+
 -- Body joints used for recording, keyed by Part1 name.
-function Rig.getJoints(model: Instance): { [string]: Motor6D }
+function Rig.getJoints(model: Instance): { [string]: Instance }
 	local map = {}
 	for _, d in model:GetDescendants() do
-		if d:IsA("Motor6D") and d.Part1 and not insideAccessory(d, model) then
-			map[d.Part1.Name] = d
+		if Rig.isMotor(d) and not insideAccessory(d, model) then
+			local _, p1 = Rig.motorInfo(d)
+			local existing = p1 and map[p1.Name]
+			-- an AnimationConstraint is the live joint when both kinds are present
+			if p1 and not (existing and existing:IsA("AnimationConstraint")) then
+				map[p1.Name] = d
+			end
 		end
 	end
 	return map
@@ -4122,7 +6307,9 @@ end
 
 local function jointParts(j: Instance): (BasePart?, BasePart?)
 	local p0, p1
-	if j:IsA("JointInstance") or j:IsA("WeldConstraint") then
+	if j:IsA("AnimationConstraint") then
+		p0, p1 = Rig.motorInfo(j)
+	elseif j:IsA("JointInstance") or j:IsA("WeldConstraint") then
 		p0, p1 = (j :: any).Part0, (j :: any).Part1
 	elseif j:IsA("RigidConstraint") then
 		local a0, a1 = j.Attachment0, j.Attachment1
@@ -4188,14 +6375,20 @@ function Rig.prepare(model: Model)
 
 	local edges = {}
 	local joints = {}
+	local disable = {}
 	for _, d in model:GetDescendants() do
+		if d:IsA("JointInstance") or d:IsA("Constraint") or d:IsA("WeldConstraint") then
+			table.insert(disable, d)
+		end
 		local p0, p1 = jointParts(d)
 		if p0 and inModel[p0] and inModel[p1] then
 			table.insert(joints, d)
 			edges[p0] = edges[p0] or {}
 			edges[p1] = edges[p1] or {}
-			table.insert(edges[p0], { other = p1, joint = d })
-			table.insert(edges[p1], { other = p0, joint = d })
+			-- animated joints first, so a part reachable both ways is driven by its animation
+			local motor = Rig.isMotor(d)
+			table.insert(edges[p0], if motor then 1 else #edges[p0] + 1, { other = p1, joint = d })
+			table.insert(edges[p1], if motor then 1 else #edges[p1] + 1, { other = p0, joint = d })
 		end
 	end
 
@@ -4213,12 +6406,13 @@ function Rig.prepare(model: Model)
 				visited[other] = true
 				table.insert(queue, other)
 				local node = { part = other, parent = current }
-				if j:IsA("Motor6D") and not insideAccessory(j, model) then
+				if Rig.isMotor(j) and not insideAccessory(j, model) then
+					local p0, p1, c0, c1 = Rig.motorInfo(j)
 					node.motor = true
-					node.name = j.Part1.Name
-					node.invert = j.Part0 ~= current
-					node.c0 = j.C0
-					node.c1 = j.C1
+					node.name = (p1 :: BasePart).Name
+					node.invert = p0 ~= current
+					node.c0 = c0
+					node.c1 = c1
 				else
 					node.offset = rigidOffset(j, current, other)
 				end
@@ -4232,7 +6426,7 @@ function Rig.prepare(model: Model)
 		end
 	end
 
-	for _, j in joints do
+	for _, j in disable do
 		pcall(function()
 			(j :: any).Enabled = false
 		end)
@@ -4244,31 +6438,26 @@ function Rig.prepare(model: Model)
 	end
 
 	local partList = { root }
+	local byName = {}
 	for i, node in nodes do
 		partList[i + 1] = node.part
+		if node.motor and not byName[node.name] then
+			byName[node.name] = node
+		end
 	end
 	return {
 		root = root,
 		humanoid = humanoid,
 		nodes = nodes,
+		byName = byName,
 		partList = partList,
 		cframes = table.create(#partList),
 		solved = {},
-		mappedParts = nil,
 	}
 end
 
-function Rig.apply(info, recParts: { string }, rootCf: CFrame, joints: { CFrame }?)
-	if info.mappedParts ~= recParts then
-		local index = {}
-		for i, name in recParts do
-			index[name] = i
-		end
-		for _, node in info.nodes do
-			node.recIndex = if node.motor then index[node.name] else nil
-		end
-		info.mappedParts = recParts
-	end
+-- pose: joint transform per Part1 name; joints without an entry keep their rest pose.
+function Rig.applyPose(info, rootCf: CFrame, pose: { [string]: CFrame }?)
 	local solved = info.solved
 	local cframes = info.cframes
 	solved[info.root] = rootCf
@@ -4277,7 +6466,7 @@ function Rig.apply(info, recParts: { string }, rootCf: CFrame, joints: { CFrame 
 		local parentCf = solved[node.parent] or rootCf
 		local cf
 		if node.motor then
-			local t = (joints and node.recIndex and joints[node.recIndex]) or CFrame.identity
+			local t = (pose and pose[node.name]) or CFrame.identity
 			if node.invert then
 				cf = parentCf * node.c1 * t:Inverse() * node.c0:Inverse()
 			else
@@ -4296,7 +6485,7 @@ return Rig
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="17">
+      <Item class="ModuleScript" referent="28">
         <Properties>
           <string name="Name">RuntimePlayer</string>
           <string name="Source"><![CDATA[--!nonstrict
@@ -4430,7 +6619,7 @@ return RuntimePlayer
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="18">
+      <Item class="ModuleScript" referent="29">
         <Properties>
           <string name="Name">SceneData</string>
           <string name="Source"><![CDATA[--!nonstrict
@@ -4447,6 +6636,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Codec = require(script.Parent.Codec)
 local CameraTrack = require(script.Parent.CameraTrack)
 local Rig = require(script.Parent.Rig)
+local Anims = require(script.Parent.Anims)
 
 local SceneData = {}
 
@@ -4617,6 +6807,13 @@ function SceneData.addSkin(actor: Instance, model: Model, name: string?): string
 	end
 	model.Name = unique
 	model.Archivable = true
+	-- keep the skin's own animations: Animate is a script and is stripped below
+	if not model:FindFirstChild(Anims.FOLDER) then
+		local set = Anims.extractFromAnimate(model)
+		if set then
+			Anims.write(model, set)
+		end
+	end
 	Rig.sanitize(model)
 	model.Parent = folder
 	local default = actor:GetAttribute("DefaultSkin")

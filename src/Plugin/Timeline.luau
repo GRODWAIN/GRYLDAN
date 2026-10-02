@@ -3,13 +3,16 @@
 local UI = require(script.Parent.UI)
 local Shared = script.Parent.Parent.Shared
 local SceneData = require(Shared.SceneData)
+local PoseTrack = require(Shared.PoseTrack)
+local Motion = require(Shared.Motion)
+local BodyParts = require(script.Parent.BodyParts)
 
 local C = UI.C
 local LABEL_W = 92
 local RULER_H = 18
 local ROW_H = 22
 local RIGHT_PAD = 10
-local MAX_VISIBLE_ROWS = 6
+local MAX_VISIBLE_ROWS = 8
 
 local Timeline = {}
 Timeline.__index = Timeline
@@ -90,7 +93,12 @@ function Timeline:beginScrub()
 	local viewLen = self.viewLen
 	app:beginDrag(function(mouse: Vector2)
 		app:seek(math.min(self:timeAtX(mouse.X, viewLen), app.playback:length()))
-	end, function() end)
+	end, function()
+		-- pose fields show values at the cursor, refresh them once the scrub ends
+		if app.tab == "anim" then
+			app:render()
+		end
+	end)
 end
 
 function Timeline:beginClipDrag(actor: Instance)
@@ -123,6 +131,113 @@ function Timeline:beginClipDrag(actor: Instance)
 			actor:SetAttribute("Offset", final)
 		end)
 	end)
+end
+
+-- Drag a pose key diamond to retime it; a click selects the part and jumps to the key.
+function Timeline:beginKeyDrag(actor: Instance, partName: string, index: number, diamond: GuiObject)
+	local app = self.app
+	local viewLen = self.viewLen
+	local offset = tonumber(actor:GetAttribute("Offset")) or 0
+	local keys = PoseTrack.get(actor)[partName]
+	local key = keys and keys[index]
+	if not key then
+		return
+	end
+	local startT = key.t
+	local startX = app.widget:GetRelativeMousePosition().X
+	local moved = false
+	local newT = startT
+	app:pausePlayback()
+	app:beginDrag(function(mouse: Vector2)
+		local dx = mouse.X - startX
+		if math.abs(dx) < 3 and not moved then
+			return
+		end
+		moved = true
+		local width = math.max(1, self.ruler.AbsoluteSize.X)
+		newT = math.max(0, startT + dx / width * viewLen)
+		newT = math.floor(newT * 30 + 0.5) / 30
+		diamond.Position = UDim2.new((offset + newT) / viewLen, 0, 0.5, 0)
+	end, function()
+		app.selectedPart = partName
+		app.selected = actor
+		app.tab = "anim"
+		if not moved then
+			app:seek(offset + startT)
+			app:render()
+			return
+		end
+		local tracks = PoseTrack.copy(PoseTrack.get(actor))
+		local list = tracks[partName]
+		if list and list[index] then
+			list[index].t = newT
+		end
+		app:mutate("перенос ключа позы", function()
+			PoseTrack.set(actor, tracks)
+		end)
+		app:seek(offset + newT)
+	end)
+end
+
+-- Extra lanes under the selected actor: timed actions and one lane per posed body part.
+function Timeline:addActorSubrows(actor: Instance): number
+	local app = self.app
+	local viewLen = self.viewLen
+	local offset = tonumber(actor:GetAttribute("Offset")) or 0
+	local rows = 0
+	local actions = Motion.getActions(actor)
+	if #actions > 0 then
+		rows += 1
+		local lane = self:makeRow("  ↳ Действия", C.dim, function()
+			app:setTab("anim")
+		end)
+		for _, a in actions do
+			local bar = UI.new("Frame", {
+				BackgroundColor3 = C.good,
+				BackgroundTransparency = 0.3,
+				BorderSizePixel = 0,
+				Position = UDim2.new((offset + a.t) / viewLen, 0, 0, 4),
+				Size = UDim2.new(Motion.actionLength(a) / viewLen, 0, 1, -8),
+				ZIndex = 2,
+				Parent = lane,
+			})
+			UI.corner(bar, 3)
+			UI.new("UISizeConstraint", { MinSize = Vector2.new(4, 0), Parent = bar })
+		end
+	end
+	local tracks = PoseTrack.get(actor)
+	local names = {}
+	for name in tracks do
+		table.insert(names, name)
+	end
+	table.sort(names, BodyParts.compare)
+	for _, name in names do
+		rows += 1
+		local isSel = app.tab == "anim" and app.selectedPart == name
+		local lane = self:makeRow("  ↳ " .. BodyParts.label(name), if isSel then C.warn else C.dim, function()
+			app.selectedPart = name
+			app.selected = actor
+			app:setTab("anim")
+		end)
+		for i, key in tracks[name] do
+			local diamond = UI.new("TextButton", {
+				Text = "",
+				AutoButtonColor = false,
+				BackgroundColor3 = if isSel then Color3.new(1, 1, 1) else C.accent,
+				BorderSizePixel = 0,
+				AnchorPoint = Vector2.new(0.5, 0.5),
+				Position = UDim2.new((offset + key.t) / viewLen, 0, 0.5, 0),
+				Size = UDim2.fromOffset(9, 9),
+				Rotation = 45,
+				ZIndex = 3,
+				Parent = lane,
+			})
+			diamond.MouseButton1Down:Connect(function()
+				self:beginKeyDrag(actor, name, i, diamond)
+			end)
+		end
+	end
+	return rows
 end
 
 function Timeline:drawTicks()
@@ -244,6 +359,7 @@ function Timeline:rebuild()
 	end
 
 	local actors = if root then SceneData.listActors(root) else {}
+	local subrows = 0
 	for _, actor in actors do
 		local color = actor:GetAttribute("Color") or C.accent
 		local enabled = actor:GetAttribute("Enabled") ~= false
@@ -294,9 +410,12 @@ function Timeline:rebuild()
 		clip.MouseButton1Down:Connect(function()
 			self:beginClipDrag(actor)
 		end)
+		if actor == app.selected then
+			subrows += self:addActorSubrows(actor)
+		end
 	end
 
-	local rowCount = 1 + #actors
+	local rowCount = 1 + #actors + subrows
 	local height = RULER_H + 4 + math.min(rowCount, MAX_VISIBLE_ROWS) * (ROW_H + 2) + 4
 	if height ~= self.height then
 		self.height = height

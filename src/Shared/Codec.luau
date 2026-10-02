@@ -91,6 +91,9 @@ function Codec.encodeRecording(rec): string
 		for j = 1, #rec.parts do
 			pushCFrame(nums, frame.joints[j] or CFrame.identity)
 		end
+		if frame.s then
+			table.insert(nums, tostring(frame.s))
+		end
 		out[i] = table.concat(nums, ",")
 	end
 	return "~" .. asciiEscape(HttpService:JSONEncode(header)) .. "\n" .. table.concat(out, ";")
@@ -128,7 +131,9 @@ function Codec.decodeRecording(str: string)
 				local base = 6 * j + 1
 				joints[j] = if base + 5 <= k then Codec.arrayToCFrame(nums, base) else CFrame.identity
 			end
-			table.insert(frames, { root = Codec.arrayToCFrame(nums, 1), joints = joints })
+			-- optional trailing number: recorded Humanoid state code (see Recorder)
+			local s = if k == 6 + 6 * #parts + 1 then nums[k] else nil
+			table.insert(frames, { root = Codec.arrayToCFrame(nums, 1), joints = joints, s = s })
 		end
 	end
 	local rec = {

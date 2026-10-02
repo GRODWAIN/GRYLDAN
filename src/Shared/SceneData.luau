@@ -12,6 +12,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Codec = require(script.Parent.Codec)
 local CameraTrack = require(script.Parent.CameraTrack)
 local Rig = require(script.Parent.Rig)
+local Anims = require(script.Parent.Anims)
 
 local SceneData = {}
 
@@ -182,6 +183,13 @@ function SceneData.addSkin(actor: Instance, model: Model, name: string?): string
 	end
 	model.Name = unique
 	model.Archivable = true
+	-- keep the skin's own animations: Animate is a script and is stripped below
+	if not model:FindFirstChild(Anims.FOLDER) then
+		local set = Anims.extractFromAnimate(model)
+		if set then
+			Anims.write(model, set)
+		end
+	end
 	Rig.sanitize(model)
 	model.Parent = folder
 	local default = actor:GetAttribute("DefaultSkin")

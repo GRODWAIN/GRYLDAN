@@ -14,6 +14,7 @@ local Rig = require(Shared.Rig)
 local SceneData = require(Shared.SceneData)
 local Playback = require(Shared.Playback)
 local Log = require(Shared.Log)
+local ClipLibrary = require(Shared.ClipLibrary)
 
 local UI = require(script.Parent.UI)
 local Timeline = require(script.Parent.Timeline)
@@ -21,6 +22,9 @@ local History = require(script.Parent.History)
 local Appearance = require(script.Parent.Appearance)
 local Bridge = require(script.Parent.Bridge)
 local Version = require(script.Parent.Version)
+local AnimTab = require(script.Parent.AnimTab)
+local Gizmo = require(script.Parent.Gizmo)
+local ClipLoader = require(script.Parent.ClipLoader)
 
 local C = UI.C
 local GAP = 6
@@ -43,6 +47,7 @@ local AUTO_IMPORT_MAX_AGE = 6 * 3600
 
 local TABS = {
 	{ id = "actors", label = "Актёры" },
+	{ id = "anim", label = "Анимация" },
 	{ id = "camera", label = "Камера" },
 	{ id = "record", label = "Запись" },
 	{ id = "scene", label = "Сцена" },
@@ -88,6 +93,11 @@ function App.start(plugin: Plugin)
 	self.bridge = Bridge.new(plugin)
 	self.showPath = false
 	self.pathKey = nil
+	self.selectedPart = "Head"
+	self.gizmoMode = "rotate"
+	self.gizmoSnap = false
+	self.poseClipboard = nil
+	self.animSkin = setmetatable({}, { __mode = "k" })
 
 	-- Camera children are local to this Studio window: previews are not replicated to Team Create
 	-- collaborators and are never saved.
@@ -107,6 +117,31 @@ function App.start(plugin: Plugin)
 		Log.error(text)
 	end
 
+	ClipLibrary.setLoader(ClipLoader)
+	ClipLibrary.setWriter(function(fn)
+		return History.record("BBS: загрузка анимации", fn)
+	end)
+	local clipRefreshQueued = false
+	ClipLibrary.onChanged(function()
+		-- coalesce bursts of finished downloads into one refresh
+		if clipRefreshQueued or not self.alive then
+			return
+		end
+		clipRefreshQueued = true
+		task.defer(function()
+			clipRefreshQueued = false
+			if not self.alive then
+				return
+			end
+			if not self.playback.playing then
+				self.playback:evaluate(self.playback.time)
+			end
+			if self.tab == "anim" then
+				self:render()
+			end
+		end)
+	end)
+
 	local toolbar = plugin:CreateToolbar("BBS Studio")
 	self.button = toolbar:CreateButton("BBSStudioOpen", "BBS Studio — съёмка машинимы", "", "BBS Studio")
 	self.button.ClickableWhenViewportHidden = true
@@ -124,6 +159,7 @@ function App.start(plugin: Plugin)
 	self.button:SetActive(self.widget.Enabled)
 
 	self:buildShell()
+	self.gizmo = Gizmo.new(self)
 
 	local function track(conn)
 		table.insert(self.connections, conn)
@@ -174,6 +210,9 @@ function App.start(plugin: Plugin)
 		self.alive = false
 		self.playback:destroy()
 		self:clearPath()
+		if self.gizmo then
+			self.gizmo:destroy()
+		end
 		for _, conn in self.connections do
 			conn:Disconnect()
 		end
@@ -396,6 +435,9 @@ end
 function App:onTime(t: number)
 	self.timeLabel.Text = UI.formatTime(t) .. " / " .. UI.formatTime(self.playback:length())
 	self.timeline:updatePlayhead(t)
+	if self.gizmo then
+		self.gizmo:update()
+	end
 end
 
 function App:updateTransport()
@@ -465,6 +507,8 @@ function App:render()
 	UI.clear(self.content)
 	if self.tab == "actors" then
 		self:renderActors()
+	elseif self.tab == "anim" then
+		AnimTab.render(self)
 	elseif self.tab == "camera" then
 		self:renderCamera()
 	elseif self.tab == "record" then
@@ -715,6 +759,11 @@ function App:renderActorDetails(actor: Instance)
 	}, { Parent = sec })
 
 	-- skins
+	local motionRow = UI.row({}, { Parent = sec })
+	UI.flex(UI.label("Анимация, позы и действия", { Parent = motionRow, Size = UDim2.fromOffset(80, 24), TextColor3 = C.dim }))
+	UI.button("Открыть вкладку «Анимация» →", function()
+		self:setTab("anim")
+	end, { Parent = motionRow, BackgroundColor3 = C.accent })
 	UI.label("Скины (морфы)", { Parent = sec, Font = UI.FONT_BOLD })
 	local default = actor:GetAttribute("DefaultSkin")
 	local skins = SceneData.listSkins(actor)
@@ -1467,6 +1516,10 @@ function App:renderDiagnostics()
 		"Активных тестов: " .. (if self.bridge:hasActiveTests() then "есть" else "нет"),
 		string.format("Актёров: %d · видимых марионеток сейчас: %d", #actors, puppets),
 		"Ожидают импорта: " .. (#self.bridge:getPendingIndex() + #self.importQueue),
+		(function()
+			local loaded, failed = ClipLibrary.counts()
+			return string.format("Анимаций в плейсе: %d · не загрузились: %d", loaded, failed)
+		end)(),
 	}
 	for _, line in lines do
 		UI.label(line, { Parent = sec, TextSize = 13, TextColor3 = C.dim })
@@ -1487,6 +1540,10 @@ function App:renderDiagnostics()
 end
 
 function App:installRuntime()
+	local clips = AnimTab.prefetch()
+	if clips > 0 then
+		Log.info("анимаций для игры: " .. clips .. " (недостающие докачиваются и сохраняются в BBS_Data.Clips)")
+	end
 	local ok = History.record("BBS: установка проигрывателя", function()
 		SceneData.getRoot(true)
 		local old = ReplicatedStorage:FindFirstChild(RUNTIME_FOLDER)

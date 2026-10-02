@@ -1,33 +1,8 @@
-local fs = require("@lune/fs")
-local luau = require("@lune/luau")
-local serde = require("@lune/serde")
-local roblox = require("@lune/roblox")
-local CFrame, Vector3, Instance = roblox.CFrame, roblox.Vector3, roblox.Instance
-
-local SRC = "src/Shared/"
-local guidN = 0
-local HttpService = {
-	JSONEncode = function(_, v) return serde.encode("json", v) end,
-	JSONDecode = function(_, s) return serde.decode("json", s) end,
-	GenerateGUID = function() guidN += 1; return string.format("%08x-aaaa-bbbb-cccc-dddddddddddd", guidN) end,
-}
-local ReplicatedStorage = Instance.new("Folder")
-local services = { HttpService = HttpService, ReplicatedStorage = ReplicatedStorage, Workspace = {} }
-local game = { GetService = function(_, n) return services[n] or error("no service " .. n) end }
-
-local cache = {}
-local function load(name)
-	if cache[name] then return cache[name] end
-	local scriptProxy = { Parent = setmetatable({}, { __index = function(_, k) return { __module = k } end }) }
-	local env = setmetatable({
-		game = game, script = scriptProxy, CFrame = CFrame, Vector3 = Vector3, Instance = Instance,
-		Color3 = roblox.Color3, Enum = roblox.Enum,
-		require = function(m) return load(m.__module) end,
-	}, { __index = _G })
-	local src = fs.readFile(SRC .. name .. ".luau")
-	cache[name] = luau.load(luau.compile(src), { debugName = name, environment = env })()
-	return cache[name]
-end
+local H = require("./harness")
+local CFrame, Instance = H.CFrame, H.Instance
+local near, check = H.near, H.check
+local load = H.load
+local ReplicatedStorage = H.services.ReplicatedStorage
 
 local Codec, CameraTrack, SceneData = load("Codec"), load("CameraTrack"), load("SceneData")
 

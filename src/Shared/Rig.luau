@@ -17,12 +17,38 @@ local function insideAccessory(inst: Instance, model: Instance): boolean
 	return false
 end
 
+-- Animated joints: classic Motor6D, and AnimationConstraint which replaces it in R15 avatars
+-- since the Avatar Joint Upgrade. Both expose Transform with the same meaning.
+function Rig.isMotor(j: Instance): boolean
+	return j:IsA("Motor6D") or j:IsA("AnimationConstraint")
+end
+
+-- Part0, Part1, C0, C1 of an animated joint.
+function Rig.motorInfo(j: Instance): (BasePart?, BasePart?, CFrame?, CFrame?)
+	if j:IsA("Motor6D") then
+		return j.Part0, j.Part1, j.C0, j.C1
+	elseif j:IsA("AnimationConstraint") then
+		local a0, a1 = j.Attachment0, j.Attachment1
+		local p0 = a0 and a0.Parent
+		local p1 = a1 and a1.Parent
+		if p0 and p1 and p0:IsA("BasePart") and p1:IsA("BasePart") then
+			return p0, p1, a0.CFrame, a1.CFrame
+		end
+	end
+	return nil, nil, nil, nil
+end
+
 -- Body joints used for recording, keyed by Part1 name.
-function Rig.getJoints(model: Instance): { [string]: Motor6D }
+function Rig.getJoints(model: Instance): { [string]: Instance }
 	local map = {}
 	for _, d in model:GetDescendants() do
-		if d:IsA("Motor6D") and d.Part1 and not insideAccessory(d, model) then
-			map[d.Part1.Name] = d
+		if Rig.isMotor(d) and not insideAccessory(d, model) then
+			local _, p1 = Rig.motorInfo(d)
+			local existing = p1 and map[p1.Name]
+			-- an AnimationConstraint is the live joint when both kinds are present
+			if p1 and not (existing and existing:IsA("AnimationConstraint")) then
+				map[p1.Name] = d
+			end
 		end
 	end
 	return map
@@ -55,7 +81,9 @@ end
 
 local function jointParts(j: Instance): (BasePart?, BasePart?)
 	local p0, p1
-	if j:IsA("JointInstance") or j:IsA("WeldConstraint") then
+	if j:IsA("AnimationConstraint") then
+		p0, p1 = Rig.motorInfo(j)
+	elseif j:IsA("JointInstance") or j:IsA("WeldConstraint") then
 		p0, p1 = (j :: any).Part0, (j :: any).Part1
 	elseif j:IsA("RigidConstraint") then
 		local a0, a1 = j.Attachment0, j.Attachment1
@@ -121,14 +149,20 @@ function Rig.prepare(model: Model)
 
 	local edges = {}
 	local joints = {}
+	local disable = {}
 	for _, d in model:GetDescendants() do
+		if d:IsA("JointInstance") or d:IsA("Constraint") or d:IsA("WeldConstraint") then
+			table.insert(disable, d)
+		end
 		local p0, p1 = jointParts(d)
 		if p0 and inModel[p0] and inModel[p1] then
 			table.insert(joints, d)
 			edges[p0] = edges[p0] or {}
 			edges[p1] = edges[p1] or {}
-			table.insert(edges[p0], { other = p1, joint = d })
-			table.insert(edges[p1], { other = p0, joint = d })
+			-- animated joints first, so a part reachable both ways is driven by its animation
+			local motor = Rig.isMotor(d)
+			table.insert(edges[p0], if motor then 1 else #edges[p0] + 1, { other = p1, joint = d })
+			table.insert(edges[p1], if motor then 1 else #edges[p1] + 1, { other = p0, joint = d })
 		end
 	end
 
@@ -146,12 +180,13 @@ function Rig.prepare(model: Model)
 				visited[other] = true
 				table.insert(queue, other)
 				local node = { part = other, parent = current }
-				if j:IsA("Motor6D") and not insideAccessory(j, model) then
+				if Rig.isMotor(j) and not insideAccessory(j, model) then
+					local p0, p1, c0, c1 = Rig.motorInfo(j)
 					node.motor = true
-					node.name = j.Part1.Name
-					node.invert = j.Part0 ~= current
-					node.c0 = j.C0
-					node.c1 = j.C1
+					node.name = (p1 :: BasePart).Name
+					node.invert = p0 ~= current
+					node.c0 = c0
+					node.c1 = c1
 				else
 					node.offset = rigidOffset(j, current, other)
 				end
@@ -165,7 +200,7 @@ function Rig.prepare(model: Model)
 		end
 	end
 
-	for _, j in joints do
+	for _, j in disable do
 		pcall(function()
 			(j :: any).Enabled = false
 		end)
@@ -177,31 +212,26 @@ function Rig.prepare(model: Model)
 	end
 
 	local partList = { root }
+	local byName = {}
 	for i, node in nodes do
 		partList[i + 1] = node.part
+		if node.motor and not byName[node.name] then
+			byName[node.name] = node
+		end
 	end
 	return {
 		root = root,
 		humanoid = humanoid,
 		nodes = nodes,
+		byName = byName,
 		partList = partList,
 		cframes = table.create(#partList),
 		solved = {},
-		mappedParts = nil,
 	}
 end
 
-function Rig.apply(info, recParts: { string }, rootCf: CFrame, joints: { CFrame }?)
-	if info.mappedParts ~= recParts then
-		local index = {}
-		for i, name in recParts do
-			index[name] = i
-		end
-		for _, node in info.nodes do
-			node.recIndex = if node.motor then index[node.name] else nil
-		end
-		info.mappedParts = recParts
-	end
+-- pose: joint transform per Part1 name; joints without an entry keep their rest pose.
+function Rig.applyPose(info, rootCf: CFrame, pose: { [string]: CFrame }?)
 	local solved = info.solved
 	local cframes = info.cframes
 	solved[info.root] = rootCf
@@ -210,7 +240,7 @@ function Rig.apply(info, recParts: { string }, rootCf: CFrame, joints: { CFrame 
 		local parentCf = solved[node.parent] or rootCf
 		local cf
 		if node.motor then
-			local t = (joints and node.recIndex and joints[node.recIndex]) or CFrame.identity
+			local t = (pose and pose[node.name]) or CFrame.identity
 			if node.invert then
 				cf = parentCf * node.c1 * t:Inverse() * node.c0:Inverse()
 			else

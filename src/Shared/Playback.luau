@@ -6,6 +6,8 @@ local Workspace = game:GetService("Workspace")
 
 local Codec = require(script.Parent.Codec)
 local CameraTrack = require(script.Parent.CameraTrack)
+local Motion = require(script.Parent.Motion)
+local PoseTrack = require(script.Parent.PoseTrack)
 local Rig = require(script.Parent.Rig)
 local SceneData = require(script.Parent.SceneData)
 
@@ -22,6 +24,8 @@ function Playback.new(opts)
 	end
 	self.puppets = {}
 	self.exclude = {}
+	-- temporary pose offsets while a gizmo is dragged: live[actorId][partName] = CFrame
+	self.live = {}
 	self.time = 0
 	self.playing = false
 	self.loop = false
@@ -116,6 +120,20 @@ function Playback:getPuppet(actor: Instance): Model?
 	return state and state.model
 end
 
+-- Puppet part driven by the joint named `name` (or the root for PoseTrack.ROOT) and its rig node.
+function Playback:getPuppetPart(actor: Instance, name: string): (BasePart?, any)
+	local state = self.puppets[actor]
+	local rig = state and state.rig
+	if not rig or not state.model or not state.model.Parent then
+		return nil, nil
+	end
+	if name == PoseTrack.ROOT then
+		return rig.root, nil
+	end
+	local node = rig.byName[name]
+	return node and node.part, node
+end
+
 function Playback:ensureSkin(actor: Instance, state, skinName: string?): Model?
 	if state.skin == skinName and state.model and state.model.Parent then
 		return state.model
@@ -171,9 +189,10 @@ function Playback:evaluateActor(actor: Instance, state, t: number)
 	if not rec then
 		return
 	end
-	local rootCf, joints = Codec.sample(rec, rel)
+	local source = SceneData.getSkin(actor, skin :: string)
+	local rootCf, pose = Motion.evaluate(actor, rec, source, rel, self.live[actor.Name])
 	if rootCf then
-		Rig.apply(state.rig, rec.parts, rootCf, joints)
+		Rig.applyPose(state.rig, rootCf, pose)
 	end
 end
 
